@@ -181,51 +181,59 @@ class MuseEngine:
             try:
                 self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
             except Exception:
-                pass
-            with self._contexts_lock:
-                self._active_contexts.discard(ctx_id)
-            self.current_context_id = None
+                pass  # Keep unconfirmed contexts available for cleanup retry.
+            else:
+                with self._contexts_lock:
+                    self._active_contexts.discard(ctx_id)
+                self.current_context_id = None
         self.current_acc_id = None
 
     def _open_page(self):
-        """为当前工作线程创建独立的页面。
-        若浏览器主连接存在，则创建独立的 Incognito BrowserContext，实现多账号 Cookies 与会话 100% 隔离。"""
-        if self.browser:
-            try:
-                res = self.browser.send("Target.createBrowserContext")
-                ctx_id = res.get("result", {}).get("browserContextId")
-                if ctx_id:
-                    self.current_context_id = ctx_id
+        """为当前线程创建隔离页面；隔离失败时终止，不能回退到共享上下文。"""
+        browser = self.browser
+        if not browser:
+            raise MuseGenerationError("浏览器连接不可用，无法创建隔离页面")
+        ctx_id = None
+        page = None
+        try:
+            res = browser.send("Target.createBrowserContext")
+            ctx_id = res.get("result", {}).get("browserContextId")
+            if not ctx_id:
+                raise MuseGenerationError("浏览器未返回隔离上下文")
+            self.current_context_id = ctx_id
+            with self._contexts_lock:
+                self._active_contexts.add(ctx_id)
+            t_res = browser.send("Target.createTarget", {
+                "url": "about:blank",
+                "browserContextId": ctx_id
+            })
+            target_id = t_res.get("result", {}).get("targetId")
+            if not target_id:
+                raise MuseGenerationError("浏览器未返回隔离页面")
+            ws_url = f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}"
+            page = CDP(ws_url, timeout=180)
+            page.send("Network.enable")
+            page.send("Page.enable")
+            page.send("Runtime.enable")
+            page.send("Browser.setDownloadBehavior",
+                      {"behavior": "allow", "downloadPath": self.cfg.download_dir})
+            return page
+        except Exception as exc:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if ctx_id:
+                try:
+                    browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
+                except Exception:
+                    pass
+                else:
                     with self._contexts_lock:
-                        self._active_contexts.add(ctx_id)
-                    t_res = self.browser.send("Target.createTarget", {
-                        "url": "about:blank",
-                        "browserContextId": ctx_id
-                    })
-                    target_id = t_res.get("result", {}).get("targetId")
-                    if target_id:
-                        ws_url = f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}"
-                        page = CDP(ws_url, timeout=180)
-                        page.send("Network.enable")
-                        page.send("Page.enable")
-                        page.send("Runtime.enable")
-                        page.send("Browser.setDownloadBehavior",
-                                  {"behavior": "allow", "downloadPath": self.cfg.download_dir})
-                        return page
-            except Exception as exc:
-                log.warning("Target.createBrowserContext 创建隔离上下文失败，回退到普通标签页: %s", exc)
-
-        import requests
-        tgt = requests.put(
-            f"http://127.0.0.1:{self.cfg.cdp_port}/json/new?about:blank",
-            timeout=10).json()
-        page = CDP(tgt["webSocketDebuggerUrl"], timeout=180)
-        page.send("Network.enable")
-        page.send("Page.enable")
-        page.send("Runtime.enable")
-        page.send("Browser.setDownloadBehavior",
-                  {"behavior": "allow", "downloadPath": self.cfg.download_dir})
-        return page
+                        self._active_contexts.discard(ctx_id)
+                    self.current_context_id = None
+            raise MuseGenerationError("创建隔离页面失败，已停止任务") from exc
 
     @staticmethod
     def renew_session_http(cookies: dict, expires: dict | None = None,
@@ -1009,9 +1017,7 @@ class MuseEngine:
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
                     return
-                # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
-                if has_stop and stable >= 80:
-                    return
+                # Stop 仍在时继续等待，由请求截止时间或客户端取消终止任务。
 
         raise MuseGenerationError("等待助手回复超时")
 

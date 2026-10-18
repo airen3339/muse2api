@@ -308,15 +308,53 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
-    """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
-    无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
+                     timeout: int, account_id: str | None,
+                     stop_event: threading.Event | None = None):
+    """在独立线程中执行 chat_stream，通过可取消的有界队列交付文本。
+    终态不占队列空间，保证下游停止读取时工作线程仍能清理账号和槽位。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
     import queue
     q = queue.Queue(maxsize=100)
-    stop_event = threading.Event()
+    owns_stop_event = stop_event is None
+    if stop_event is None:
+        stop_event = threading.Event()
+    done_event = threading.Event()
+    error = None
+    poll_interval = 0.05
+
+    def put_chunk(chunk):
+        while not stop_event.is_set():
+            try:
+                q.put(chunk, timeout=poll_interval)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def acquire_account(**kwargs):
+        deadline = time.monotonic() + timeout
+        while not stop_event.is_set():
+            remaining = max(0, deadline - time.monotonic())
+            try:
+                return ACCOUNT_POOL.acquire(timeout=min(poll_interval, remaining), **kwargs)
+            except MuseGenerationError:
+                # AccountPool reports an occupied account as a bounded-wait timeout.
+                if time.monotonic() >= deadline:
+                    raise
+        return None
+
+    def acquire_slot():
+        deadline = time.monotonic() + timeout
+        while not stop_event.is_set():
+            remaining = max(0, deadline - time.monotonic())
+            if GEN_LOCK.acquire(timeout=min(poll_interval, remaining)):
+                return True
+            if time.monotonic() >= deadline:
+                raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
+        return False
 
     def worker():
+        nonlocal error
         cur_id = account_id
         cur_cookies = cookies
         cur_exp = expires
@@ -331,7 +369,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         ACCOUNT_POOL.release(leased_id)
                         leased_id = None
                     try:
-                        alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
+                        alt = acquire_account(rotate=True, force_rotate=True)
                     except Exception:
                         break
                     if not alt or alt["id"] == cur_id:
@@ -344,28 +382,44 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     cur_exp = alt.get("cookies_exp")
                     log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
                 elif cur_id:
-                    ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
+                    if acquire_account(account_id=cur_id) is None:
+                        return
                     leased_id = cur_id
 
                 yielded = False
                 try:
+                    if stop_event.is_set():
+                        return
                     if cur_id:
                         refreshed = _renew_and_persist(cur_id, wake_vm=True, force=(attempt > 0))
                         if refreshed:
                             cur_cookies = refreshed["cookies"]
                             cur_exp = refreshed.get("cookies_exp")
-                    with GEN_LOCK:
+                    if not acquire_slot():
+                        return
+                    try:
                         if stop_event.is_set():
                             return
                         engine.start()
-                        for chunk in engine.chat_stream(
+                        if stop_event.is_set():
+                            return
+                        upstream = engine.chat_stream(
                             cur_cookies, prompt, cur_exp, timeout,
                             account_id=cur_id, stop_event=stop_event
-                        ):
-                            yielded = True
-                            q.put(("data", chunk))
-                            if stop_event.is_set():
-                                return
+                        )
+                        try:
+                            for chunk in upstream:
+                                if not put_chunk(chunk):
+                                    return
+                                yielded = True
+                        finally:
+                            close = getattr(upstream, "close", None)
+                            if close:
+                                close()
+                    finally:
+                        GEN_LOCK.release()
+                    if stop_event.is_set():
+                        return
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
@@ -374,7 +428,10 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     last_exc = exc
                     if cur_id:
                         store.mark(cur_id, False, str(exc))
-                    engine.close_current_page()
+                    try:
+                        engine.close_current_page()
+                    except Exception:
+                        pass  # Preserve the authentication failure through cleanup/retry.
                     if yielded:
                         break
                 except Exception as exc:
@@ -386,26 +443,123 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if yielded:
                         break
             if last_exc is not None:
-                q.put(("error", last_exc))
+                raise last_exc
+        except Exception as exc:
+            # Acquisition, initialization and cleanup failures must reach the caller.
+            error = exc
         finally:
-            if leased_id:
-                ACCOUNT_POOL.release(leased_id)
-            engine.close_current_page()
-            q.put(("done", None))
+            try:
+                engine.close_current_page()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+            try:
+                if leased_id:
+                    ACCOUNT_POOL.release(leased_id)
+            except Exception as exc:
+                if error is None:
+                    error = exc
+            finally:
+                done_event.set()
 
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=worker, name="muse-chat-worker", daemon=True).start()
 
     try:
-        while True:
-            kind, val = q.get()
-            if kind == "data":
-                yield val
-            elif kind == "error":
-                raise val
+        while not stop_event.is_set():
+            try:
+                chunk = q.get(timeout=poll_interval)
+            except queue.Empty:
+                if done_event.is_set():
+                    # A final chunk may have arrived between get() timing out and
+                    # observing completion; drain it before exposing the terminal state.
+                    try:
+                        chunk = q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        yield chunk
+                        continue
+                    if error is not None:
+                        raise error
+                    break
             else:
-                break
+                yield chunk
     finally:
-        stop_event.set()
+        # A completed HTTP stream still needs to emit its normal SSE/error tail.
+        if owns_stop_event or not done_event.is_set():
+            stop_event.set()
+
+
+class _ChatStreamingResponse(StreamingResponse):
+    """Signal disconnect before waiting for the synchronous iterator to unwind."""
+    def __init__(self, stream, stop_event):
+        self._stream = stream
+        self._stop_event = stop_event
+        self._iteration_lock = threading.Lock()
+        super().__init__(self, media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            with self._iteration_lock:
+                if self._stop_event.is_set():
+                    raise StopIteration
+                chunk = next(self._stream)
+        finally:
+            # Check after releasing the lock, so cancellation cannot miss the
+            # handoff between an active next() and the response's finalizer.
+            self._close_if_stopped()
+        if self._stop_event.is_set():
+            raise StopIteration
+        return chunk
+
+    def _close_if_stopped(self):
+        if self._stop_event.is_set() and self._iteration_lock.acquire(blocking=False):
+            try:
+                self._stream.close()
+            finally:
+                self._iteration_lock.release()
+
+    async def listen_for_disconnect(self, receive):
+        try:
+            await super().listen_for_disconnect(receive)
+        finally:
+            # receive() can report disconnect even when no new chunk is sent.
+            self._stop_event.set()
+
+    async def __call__(self, scope, receive, send):
+        from starlette.requests import ClientDisconnect
+
+        async def stream_response():
+            try:
+                await self.stream_response(send)
+            except OSError as exc:
+                raise ClientDisconnect() from exc
+
+        # Listen on every ASGI version: a paused stream may never call send again.
+        tasks = (asyncio.create_task(stream_response(), name="muse-chat-send"),
+                 asyncio.create_task(self.listen_for_disconnect(receive), name="muse-chat-receive"))
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Signal the synchronous iterator before cancelling its async reader.
+            self._stop_event.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                self._close_if_stopped()
+            # An active next() owns closing the iterator in its own thread.
+        # Retrieve both results, including errors racing with a disconnect.
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                raise result
+        if self.background is not None:
+            await self.background()
 
 
 class ImageRequest(BaseModel):
@@ -1329,12 +1483,14 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return [head, body]
 
     if req.stream:
+        stop_event = threading.Event()
+        stream_gen = safe_chat_stream(cookies, prompt, expires, timeout,
+                                      account_id=acc_id, stop_event=stop_event)
         def sync_stream():
             try:
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1393,7 +1549,9 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 502}})
             except Exception as exc:
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+            finally:
+                stream_gen.close()
+        return _ChatStreamingResponse(sync_stream(), stop_event)
 
     def run() -> str:
         return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
@@ -1492,6 +1650,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                           "total_tokens": 0}}
 
     if req.stream:
+        stop_event = threading.Event()
+        stream_gen = safe_chat_stream(cookies, prompt, expires, timeout,
+                                      account_id=acc_id, stop_event=stop_event)
         def sync_stream():
             try:
                 yield _sse_event("response.created", {
@@ -1507,7 +1668,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "part": {"type": "output_text", "text": "",
                              "annotations": []}})
                 full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+                for chunk in stream_gen:
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1529,7 +1690,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
                     "response": envelope("failed")})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+            finally:
+                stream_gen.close()
+        return _ChatStreamingResponse(sync_stream(), stop_event)
 
     def run() -> str:
         return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
@@ -1693,12 +1856,9 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
         raise HTTPException(400, "未解析到 cookie")
     exp = {k: int(v) for k, v in (payload.get("expires") or {}).items()
            if _pos(v)}
-    # 补入的是「全新会话」的 cookie，有效期估算锚点必须重置到当下，
-    # 否则会沿用旧会话的锚点，把剩余天数算少。
-    acc = store.update_account(aid, cookies=cookies, ok=None,
-                               note="已更新 cookie",
-                               expiry_anchor=int(time.time()),
-                               cookies_exp=exp or None)
+    # 手动补入新会话时清除旧会话的检测/额度结果及过期时间。
+    # 自动续期仍使用 update_account，保留同一会话已确认的状态。
+    acc = store.replace_cookies(aid, cookies, cookies_exp=exp)
     if not acc:
         raise HTTPException(404, "账号不存在")
     return {"ok": True, "id": aid, "cookie_count": len(cookies),

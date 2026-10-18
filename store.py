@@ -230,7 +230,7 @@ class Store:
         估算锚点 expiry_anchor 的维护规则（避免有效期被反复虚推）：
           - 读到了 hatch_vml 的真实 expires  -> 清空锚点，直接用真值；
           - 读不到且锚点为空                -> 把锚点钉在当下（只钉一次）；
-          - 补入全新会话 cookie（重登）      -> 调用方显式传 expiry_anchor=now 重置。
+          - 补入全新会话 cookie（重登）      -> 使用 replace_cookies 清除旧会话状态。
         """
         with _LOCK:
             for a in self.accounts:
@@ -248,6 +248,27 @@ class Store:
                             ce, a.get("expiry_anchor") or a.get("created_at"))
                     _write(self.cfg.accounts_file, self.accounts)
                     return a
+        return None
+
+    def replace_cookies(self, aid: str, cookies: dict,
+                        cookies_exp: dict | None = None) -> dict | None:
+        """保存重新登录的会话；旧会话的健康、额度和有效期不能沿用。"""
+        with _LOCK:
+            for a in self.accounts:
+                if a["id"] != aid:
+                    continue
+                now = int(time.time())
+                exp = {k: int(v) for k, v in (cookies_exp or {}).items()
+                       if _is_pos(v)}
+                a.update(
+                    cookies=dict(cookies), cookies_exp=exp,
+                    expires_at=account_expiry(exp, now),
+                    expiry_anchor=None if _is_pos(exp.get("hatch_vml")) else now,
+                    ok=None, note="已更新 cookie，待检测", checked_at=None,
+                    last_keepalive=None, synced_at=None, quota=None,
+                )
+                _write(self.cfg.accounts_file, self.accounts)
+                return a
         return None
 
     def stats(self) -> dict:
