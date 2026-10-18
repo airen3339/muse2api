@@ -309,10 +309,13 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
-                     stop_event: threading.Event | None = None):
+                     stop_event: threading.Event | None = None,
+                     heartbeat_interval: float | None = None):
     """在独立线程中执行 chat_stream，通过可取消的有界队列交付文本。
     终态不占队列空间，保证下游停止读取时工作线程仍能清理账号和槽位。
-    若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
+    若网页首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。
+    可选心跳用 None 表示等待事件，仅供 SSE 包装转成注释；不是正文。
+    """
     import queue
     q = queue.Queue(maxsize=100)
     owns_stop_event = stop_event is None
@@ -387,6 +390,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     leased_id = cur_id
 
                 yielded = False
+                engine.chat_response_started = False
+                engine.chat_submission_started = False
                 try:
                     if stop_event.is_set():
                         return
@@ -432,7 +437,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         engine.close_current_page()
                     except Exception:
                         pass  # Preserve the authentication failure through cleanup/retry.
-                    if yielded:
+                    if yielded or getattr(engine, "chat_response_started", False) or getattr(engine, "chat_submission_started", False):
                         break
                 except Exception as exc:
                     last_exc = exc
@@ -440,7 +445,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         engine.reset_thread()
                     except Exception:
                         pass
-                    if yielded:
+                    if yielded or getattr(engine, "chat_response_started", False) or getattr(engine, "chat_submission_started", False):
                         break
             if last_exc is not None:
                 raise last_exc
@@ -464,6 +469,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
 
     threading.Thread(target=worker, name="muse-chat-worker", daemon=True).start()
 
+    last_delivery = time.monotonic()
     try:
         while not stop_event.is_set():
             try:
@@ -477,12 +483,19 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     except queue.Empty:
                         pass
                     else:
+                        last_delivery = time.monotonic()
                         yield chunk
                         continue
                     if error is not None:
                         raise error
                     break
+                if (heartbeat_interval is not None and heartbeat_interval > 0
+                        and time.monotonic() - last_delivery >= heartbeat_interval
+                        and not stop_event.is_set()):
+                    last_delivery = time.monotonic()
+                    yield None
             else:
+                last_delivery = time.monotonic()
                 yield chunk
     finally:
         # A completed HTTP stream still needs to emit its normal SSE/error tail.
@@ -1413,19 +1426,16 @@ def _want_usage(stream_options) -> bool:
     return False
 
 
-def _pace_text(text: str, chunk_size: int = 2, delay: float = 0.012):
-    """把大块文本平滑切分为仿原生 LLM 打字机的微流式 Token。
-    若传入文本本身微小（<= 3 字），直接秒级放行，零延迟；
-    若传入文本是大块（如 DOM 批量刷新），按每 chunk_size 字间隔 delay 平滑输出。
-    """
+def _pace_text(text: str, chunk_size: int = 256, delay: float = 0):
+    """Split completed text without introducing artificial typing latency."""
     if not text:
         return
-    if len(text) <= 3 or delay <= 0:
+    if len(text) <= chunk_size:
         yield text
         return
     for i in range(0, len(text), chunk_size):
         yield text[i:i + chunk_size]
-        if i + chunk_size < len(text):
+        if delay > 0 and i + chunk_size < len(text):
             time.sleep(delay)
 
 
@@ -1485,7 +1495,8 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
     if req.stream:
         stop_event = threading.Event()
         stream_gen = safe_chat_stream(cookies, prompt, expires, timeout,
-                                      account_id=acc_id, stop_event=stop_event)
+                                      account_id=acc_id, stop_event=stop_event,
+                                      heartbeat_interval=5.0)
         def sync_stream():
             try:
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
@@ -1493,12 +1504,18 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
                 if not tool_note:
                     for chunk in stream_gen:
+                        if chunk is None:
+                            yield ": keep-alive\n\n"
+                            continue
                         for piece in _pace_text(chunk):
                             yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
                     yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
                 else:
                     buf, mode = "", None
                     for chunk in stream_gen:
+                        if chunk is None:
+                            yield ": keep-alive\n\n"
+                            continue
                         if mode == "text":
                             for piece in _pace_text(chunk):
                                 yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
@@ -1652,7 +1669,8 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     if req.stream:
         stop_event = threading.Event()
         stream_gen = safe_chat_stream(cookies, prompt, expires, timeout,
-                                      account_id=acc_id, stop_event=stop_event)
+                                      account_id=acc_id, stop_event=stop_event,
+                                      heartbeat_interval=5.0)
         def sync_stream():
             try:
                 yield _sse_event("response.created", {
@@ -1669,6 +1687,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                              "annotations": []}})
                 full = ""
                 for chunk in stream_gen:
+                    if chunk is None:
+                        yield ": keep-alive\n\n"
+                        continue
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,

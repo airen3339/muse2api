@@ -13,7 +13,7 @@
   🤝 本开源项目已链接并认可 <b><a href="https://linux.do/" target="_blank">LINUX DO 社区 (https://linux.do/)</a></b> —— 新的理想型社区（真诚、友善、团结、专业）
 </p>
 
-将 **[muse.ai](https://muse.ai/)** 网页端的前沿多模态能力逆向工程封装为标准的 **OpenAI 兼容 RESTful API**。通过无头浏览器 CDP 协议穿透、热备 WebSocket 隧道复用与动态 Session 管理，原生支持文本对话（2~3 秒级流式首字响应）、文生图、图生图编辑、文生视频、首帧图生视频，并提供多账号池亲和轮转、全自动 48 小时会话续期与云端 VM 唤醒保活，以及配套 Chrome 一键导号扩展。
+将 **[muse.ai](https://muse.ai/)** 网页端的前沿多模态能力逆向工程封装为标准的 **OpenAI 兼容 RESTful API**。通过无头浏览器 CDP 协议穿透、热备 WebSocket 隧道复用与动态 Session 管理，支持文本对话（缓冲网页快照后交付正文）、文生图、图生图编辑、文生视频、首帧图生视频，并提供多账号池亲和轮转、全自动 48 小时会话续期与云端 VM 唤醒保活，以及配套 Chrome 一键导号扩展。
 
 ---
 
@@ -21,7 +21,7 @@
 
 - 💬 **标准对话接口（Chat Completions & Responses API）**
   - 完全兼容 `/v1/chat/completions` 与新版 Codex 默认使用的 `/v1/responses` 标准协议。
-  - 原生支持 SSE 流式打字机输出（`stream=True`）与同步完整返回，内置热标签页与 Noise WebSocket 隧道亲和复用，**连续对话首字延迟仅需 2~3 秒**。
+  - 支持 SSE 与同步完整返回。网页回答会在列表、段落和代码块渲染时改写；因此先缓冲，等待 Stop 按钮消失且同一文本连续稳定约 1 秒后再交付快照，避免重复追加和丢字。SSE 等待时每 5 秒发送注释心跳，客户端正文开始时间取决于上游完整生成耗时；不再模拟逐字延迟。
   - 支持多轮对话上下文、System Prompt 设定。
   - 内置模型智能别名映射，`gpt-4o`、`gpt-5`、`claude-sonnet-4`、`deepseek-chat` 等常用模型名自动路由。
 - 🎨 **高质量生图与图像编辑（Images Generations & Edits）**
@@ -41,8 +41,8 @@
   - 可通过 `MUSE2API_CONCURRENCY` 随机器性能灵活调大并发上限（默认 2 并发）。
 - 🔄 **多账号池与热连接亲和调度**
   - 支持导入无上限的 Muse 账号矩阵。
-  - 基于热连接亲和（Warm-Tab Affinity）与 LRU 策略智能分发，兼顾 2 秒级极速响应与多号均衡消耗。
-  - 遇到单号额度耗尽或会话异常时，自动标记并 0 秒无感故障转移至备用健康账号。
+  - 基于热连接亲和（Warm-Tab Affinity）与 LRU 策略分发账号；文本对话从空白网页会话开始，API 上下文由提示词携带。
+  - 文本对话仅在确定尚未提交的准备阶段失败时保留最多一次备用账号尝试。提交动作已开始或结果未知后不自动换号重发，避免重复执行。
 - 🛡️ **48 小时会话全自动续期与云端 VM 保活**
   - 独创后台心跳协程，直连 `/api/session` 自动续签 `hatch_vml`（+48h）与 `hatch_sess`（+30d），并自动调用 `/api/hatch/vm/wake` 保持云端工作区 VM 热备。
   - 彻底解决 Meta Cookie 静态 48 小时到期与 VM 休眠断连难题，无需频繁重新登录。
@@ -112,7 +112,7 @@
        proxy_pass http://127.0.0.1:18610;
        proxy_read_timeout 600s;      # 避免生图/视频耗时较长被 Nginx 报 502 Bad Gateway
        proxy_send_timeout 600s;
-       proxy_buffering off;          # 保证 SSE 对话流式打字机 0 延迟吐字
+       proxy_buffering off;          # 及时传递 SSE 事件和等待心跳
        client_max_body_size 64M;     # 支持参考图大文件上传
        proxy_set_header Host $host;
        proxy_set_header X-Real-IP $remote_addr;
@@ -240,6 +240,7 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
 | `MUSE2API_IMAGE_TIMEOUT` | `240` | 生图超时上限（秒） |
 | `MUSE2API_VIDEO_TIMEOUT` | `600` | 生视频超时上限（秒） |
 | `MUSE2API_CHAT_TIMEOUT` | `300` | 对话生成超时上限（秒） |
+| `MUSE2API_CHAT_FIRST_TOKEN_TIMEOUT` | `90` | 提交后网页首次出现正文的等待上限（秒），并非客户端收到完整正文的时限；同时受对话总生成预算限制 |
 
 ---
 
@@ -289,6 +290,7 @@ python tests/test_media_selection.py
 ```
 
 如浏览器不在 PATH，可设置 `MUSE2API_CHROMIUM` 为可执行文件路径。
+测试默认在用户主目录创建临时 profile 以兼容 snap Chromium；可用 `MUSE2API_TEST_TEMP_ROOT` 指定其他可写且浏览器可访问的临时根目录。
 覆盖上传预览排除、结果去重、历史附件排除、精确来源下载、视频来源保持、
 禁止全局下载回退，以及参考图读取失败时中止。最终图片编辑效果仍需通过真实接口验收。
 
@@ -347,3 +349,25 @@ python tests/test_session_health.py
 - 修复保活成功误报：区分唤醒请求已接受与 VM 已运行，只有复核状态为 RUNNING 才报告唤醒成功。
 - 管理页显示额度查询时间和过期提示；账号测试分别反馈会话有效性与额度读取状态。
 - 新增离线回归测试，覆盖账号额度隔离及 VM 唤醒状态确认。
+
+## 文本对话：完成判定、超时与重试
+
+网页文字以完整快照处理，不将改写后的整段文字当作增量重发；保留所选 `innerText` 的空白和合法重复词句。单次回答出现多个助手气泡、页面切换或无法确认空白会话时明确失败，避免返回另一段回答。连续停止且同文约 1 秒是 DOM 消抖窗口，不是上游权威完成事件；它不能排除更晚的改写，输出也不保证保留网页的原始 Markdown。
+
+聊天提交先检查页面就绪、完整输入和当前输入框对应的唯一可用发送按钮，支持英文、简体和繁体标签。只尝试一次提交，不再叠加点击和 Enter 重试。提交后约 10 秒没有用户气泡或生成状态等本地迹象时，报告投递状态未知；这些迹象本身也不等于上游已确认接收。提交动作已开始或结果未知后，即使没有正文也不会自动重发，调用方同样不应盲目重试。
+
+默认网页首字预算为 90 秒，总生成预算为 300 秒；较短的请求或配置预算优先。CDP 命令使用包含锁等待的单调时间预算，拒收过期响应并恢复连接超时。调度、页面准备和清理仍有独立开销，整个 HTTP 请求不是严格的 90/300 秒硬上限。SSE 注释心跳只缓解部分读取空闲超时，不延长客户端正文首字期限或总期限；非流式响应等待期间没有心跳。
+
+聊天回归测试使用 Python 3.11+、项目依赖和 Node.js 18+，不需要 Muse 登录态。浏览器用例另外需要 Chromium/Chrome、进程权限与本机回环连接；使用临时独立 profile 和合成页面。标准应用镜像不包含 tests 和 Node，测试时需另行提供。
+
+```sh
+python -B tests/test_chat_first_token.py
+python -B tests/test_chat_snapshots.py
+python -B tests/test_chat_delivery.py
+python -B tests/test_chat_submission.py
+python -B tests/test_chat_lifecycle.py
+python -B tests/test_cdp_deadlines.py
+node --test tests/test_chat_submission_dom.mjs
+# 浏览器不在 PATH 时，先将 MUSE2API_CHROMIUM 设为其完整可执行文件路径
+python -B tests/test_chat_submission_browser.py
+```

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import mimetypes
 import urllib.request
 import json
@@ -76,6 +77,24 @@ class MuseEngine:
     @current_acc_id.setter
     def current_acc_id(self, val: str | None):
         self._ensure_local().current_acc_id = val
+
+    @property
+    def chat_response_started(self) -> bool:
+        """Whether this worker has observed an answer, even if still buffered."""
+        return bool(getattr(self._ensure_local(), "chat_response_started", False))
+
+    @chat_response_started.setter
+    def chat_response_started(self, value: bool):
+        self._ensure_local().chat_response_started = value
+
+    @property
+    def chat_submission_started(self) -> bool:
+        """A submit may have executed; never automatically replay that attempt."""
+        return bool(getattr(self._ensure_local(), "chat_submission_started", False))
+
+    @chat_submission_started.setter
+    def chat_submission_started(self, value: bool):
+        self._ensure_local().chat_submission_started = value
 
     @property
     def current_context_id(self) -> str | None:
@@ -689,6 +708,125 @@ class MuseEngine:
             return []
 
     # ---------------- 发送 ----------------
+    # Inspect only UI state, not conversation text, for connection/error notices.
+    # The same evaluation validates and performs one action, so a late page
+    # navigation or a disabled composer cannot pass an earlier stale check.
+    _CHAT_STATE_JS = r"""((prompt, epoch, action) => {
+        const visible = e => e.getClientRects().length > 0
+            && getComputedStyle(e).visibility !== 'hidden';
+        const inputs = [...document.querySelectorAll('textarea')].filter(visible);
+        const ta = inputs.length === 1 ? inputs[0] : null;
+        const sendLabel = /^(send(?: message)?|发送(?:消息)?|傳送(?:訊息|消息)?|發送(?:訊息|消息)?)$/i;
+        // Current Muse uses a cursor-text composer; also support real forms.
+        // Unknown layouts stay within the input's immediate parent.
+        const boundary = ta?.closest('form') || ta?.closest('[class*="cursor-text"]') || ta?.parentElement;
+        let composer = null, buttons = [];
+        for (let el = ta?.parentElement, n = 0; el && n < 6; el = el.parentElement, n++) {
+            if (el === document.body || el.tagName === 'MAIN') break;
+            const candidates = [...el.querySelectorAll('button,[role=button]')]
+                .filter(b => visible(b) && sendLabel.test((b.getAttribute('aria-label') || b.innerText || '').trim()));
+            if (candidates.length) { composer = el; buttons = candidates; break; }
+            if (el === boundary) break;
+        }
+        const bubbles = [...document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]')];
+        const agents = bubbles.filter(e => (e.className || '').includes('hatch-agent-bubble-bg'));
+        const users = bubbles.filter(e => (e.className || '').includes('chat-user-bubble'));
+        const stop = [...document.querySelectorAll('[data-testid="hatch-composer-stop-button"],button[aria-label*="Stop" i],button[aria-label*="停止"]')].some(visible);
+        const hydration = document.querySelector('[data-hatch-shell-hydration-state]');
+        const ui = [];
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+            const e = walker.currentNode.parentElement;
+            if (!e || e.closest('textarea,nav,aside,script,style,[class*="hatch-chat-groupable-bubble"]') || !visible(e)) continue;
+            ui.push(walker.currentNode.nodeValue);
+        }
+        const notice = ui.join(' ');
+        const state = {epoch:performance.timeOrigin, path_new:location.pathname === '/thread/new',
+            ready:document.readyState === 'complete' && (!hydration || hydration.getAttribute('data-hatch-shell-hydration-state') === 'hydrated'),
+            input_present:!!ta, input_enabled:!!ta && !ta.disabled && !ta.readOnly && ta.getAttribute('aria-disabled') !== 'true',
+            input_matches:!!ta && ta.value === prompt, input_empty:!!ta && !ta.value,
+            bubbles:bubbles.length, users:users.length, assistants:agents.length, stop,
+            attachments:document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').length,
+            connecting:/Connecting\.{3}|連接中|连接中|正在連線|正在连接/i.test(notice),
+            pending:/Still sending|Delivery not confirmed|仍在傳送|仍在发送|未確認送達/i.test(notice),
+            failed:/Failed to send|Unable to send|Something went wrong|傳送失敗|发送失败|發生錯誤/i.test(notice),
+            send_candidates:buttons.length, send_enabled:buttons.length === 1 && !buttons[0].disabled && buttons[0].getAttribute('aria-disabled') !== 'true',
+            dispatched:false, filled:false};
+        const clean = state.ready && state.path_new && state.input_enabled && !state.bubbles
+            && !state.attachments && !state.stop && !state.connecting && !state.pending && !state.failed
+            && (epoch === null || epoch === state.epoch);
+        if (action === 'fill' && clean) {
+            ta.focus();
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(ta,prompt);
+            ta.dispatchEvent(new Event('input',{bubbles:true}));
+            ta.dispatchEvent(new Event('change',{bubbles:true}));
+            state.filled = ta.value === prompt;
+        }
+        if (action === 'submit' && clean && state.input_matches && state.send_enabled) {
+            // If this throws or the response is lost, Python retains unknown
+            // submission state. It must not attempt an Enter/click fallback.
+            buttons[0].click();
+            state.dispatched = true;
+        }
+        return state;
+    })(%s, %s, %s)"""
+
+    def _chat_page_state(self, prompt: str = "", epoch=None, action="inspect") -> dict:
+        state = self.page.js(self._CHAT_STATE_JS % (json.dumps(prompt), json.dumps(epoch), json.dumps(action)), timeout=3.0)
+        required = {"epoch", "path_new", "ready", "input_present", "input_enabled",
+                    "input_matches", "input_empty", "bubbles", "users", "assistants",
+                    "stop", "attachments", "connecting", "pending", "failed",
+                    "send_candidates", "send_enabled", "dispatched", "filled"}
+        if not isinstance(state, dict) or not required.issubset(state):
+            raise MuseGenerationError("无法读取聊天页面状态")
+        return state
+
+    @staticmethod
+    def _chat_clean(state):
+        return (state["ready"] and state["path_new"] and state["input_enabled"]
+                and not any(state[k] for k in ("bubbles", "attachments", "stop", "connecting", "pending", "failed")))
+
+    def _prepare_chat_submission(self, stop_event=None):
+        # reset_thread is also used by media and legacy cleanup. Chat always
+        # independently verifies its postconditions, including its no-nav path.
+        deadline = time.monotonic() + 12.0
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise MuseGenerationError("客户端已断开，未发送提示词")
+            state = self._chat_page_state()
+            if self._chat_clean(state) and state["input_empty"]:
+                return state["epoch"]
+            time.sleep(0.15)
+        raise MuseGenerationError("聊天页面重置后未就绪，未发送提示词；请检查页面连接")
+
+    def _send_chat_once(self, prompt: str, epoch, stop_event=None):
+        if stop_event is not None and stop_event.is_set():
+            raise MuseGenerationError("客户端已断开，未发送提示词")
+        state = self._chat_page_state(prompt, epoch, "fill")
+        if not state["filled"]:
+            raise MuseGenerationError("无法确认完整提示词已输入，未发送")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise MuseGenerationError("客户端已断开，未发送提示词")
+            state = self._chat_page_state(prompt, epoch)
+            if state["epoch"] != epoch or not self._chat_clean(state) or not state["input_matches"]:
+                raise MuseGenerationError("发送前页面或输入状态已改变，未发送")
+            if state["send_candidates"] > 1:
+                raise MuseGenerationError("无法唯一定位发送按钮，未发送")
+            if state["send_enabled"]:
+                if stop_event is not None and stop_event.is_set():
+                    raise MuseGenerationError("客户端已断开，未发送提示词")
+                self.chat_submission_started = True
+                state = self._chat_page_state(prompt, epoch, "submit")
+                if state["dispatched"]:
+                    return "dispatched"
+                # An explicit no-action result is safe; an exception is unknown.
+                self.chat_submission_started = False
+                raise MuseGenerationError("点击前发送条件已改变，未发送")
+            time.sleep(0.1)
+        raise MuseGenerationError("发送按钮不可用，未发送；不会使用快捷键绕过")
+
     # 检查「文字真的进了输入框 + Send 按钮真的被渲染出来」。
     # 两个条件缺一不可：Send 按钮只有 React state 里有文字才会渲染 ——
     # 它在，就说明 React 真的收到了输入（不是 DOM value 被改了而已）。
@@ -974,11 +1112,13 @@ class MuseEngine:
         "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
         "var nonEmpty=bs.filter(function(b){return ((b.innerText||'').trim().length)>0;});"
-        "var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';"
+        "var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||''):'';"
         "var stop=!!(document.querySelector('[data-testid=\"hatch-composer-stop-button\"]')"
         "||document.querySelector('button[aria-label*=\"Stop\" i]')"
         "||document.querySelector('button[aria-label*=\"停止\"]'));"
-        "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});})()"
+        "var users=[...document.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]')]"
+        ".filter(function(b){return /chat-user-bubble/.test(b.className||'');}).length;"
+        "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop,epoch:performance.timeOrigin,users:users,path:location.pathname});})()"
     )
 
     def _agent_text(self) -> str:
@@ -1002,78 +1142,185 @@ class MuseEngine:
 
     def _poll_chat(self) -> tuple[int, str, bool]:
         try:
-            raw = self.page.js(self._POLL_CHAT_JS)
+            raw = self.page.js(self._POLL_CHAT_JS, timeout=3.0)
             if raw:
                 d = json.loads(raw)
-                return int(d.get("cnt") or 0), (d.get("txt") or "").strip(), bool(d.get("stop"))
-        except Exception:
-            pass
+                local = self._ensure_local()
+                expected = getattr(local, "chat_expected_epoch", None)
+                if expected is not None:
+                    # Identity and text are sampled atomically in the same JS
+                    # evaluation, including throughout final-answer buffering.
+                    if d.get("epoch") != expected:
+                        raise MuseGenerationError("聊天页面已重新加载，拒绝读取其他页面的回复")
+                    if not isinstance(d.get("users"), int) or d["users"] > 1:
+                        raise MuseGenerationError("无法确认当前用户消息（状态缺失或多个用户消息），拒绝读取其他对话的回复")
+                    path = d.get("path")
+                    if not isinstance(path, str) or not path.startswith("/thread/"):
+                        raise MuseGenerationError("聊天页面路径已改变，拒绝读取其他页面的回复")
+                    bound = getattr(local, "chat_bound_path", None)
+                    if bound is not None and path != bound:
+                        raise MuseGenerationError("聊天会话已切换，拒绝读取其他对话的回复")
+                    if path != "/thread/new":
+                        local.chat_bound_path = path
+                return int(d.get("cnt") or 0), d.get("txt") or "", bool(d.get("stop"))
+            raise ValueError("Empty chat polling result")
+        except MuseGenerationError:
+            raise
+        except Exception as exc:
+            # Report only error types at the request boundary, never page content.
+            local = self._ensure_local()
+            local.chat_poll_errors = getattr(local, "chat_poll_errors", 0) + 1
+            local.chat_poll_error_type = type(exc).__name__
         return 0, "", False
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None):
-        """发一条消息，流式 yield 增量文本。"""
+        """Collect a completed rendered answer, then yield it once.
+
+        The DOM is a mutable snapshot, not an append-only token stream. Lists,
+        code blocks and paragraphs may revise text already observed. Publishing
+        intermediate snapshots cannot preserve the final answer in an append-only
+        API, so no answer text is committed until generation has settled.
+        """
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
+        preparation_started = time.monotonic()
+        local = self._ensure_local()
+        local.chat_poll_errors = 0
+        local.chat_poll_error_type = None
+        local.chat_expected_epoch = None
+        local.chat_bound_path = None
+        self.chat_response_started = False
+        self.chat_submission_started = False
+        if stop_event is not None and stop_event.is_set():
+            return
         self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
-        base_agent, base_text, _ = self._poll_chat()
-        self._send(prompt)
+        if stop_event is not None and stop_event.is_set():
+            return
+        # The caller already supplies conversation history in prompt. Start a
+        # fresh page thread so an old/replaced bubble cannot become this answer.
+        self.reset_thread(for_chat=False)
+        if stop_event is not None and stop_event.is_set():
+            return
+        epoch = self._prepare_chat_submission(stop_event)
+        local.chat_expected_epoch = epoch
+        base_agent, base_text, base_stop = self._poll_chat()
+        if base_agent or base_text.strip() or base_stop or local.chat_poll_errors:
+            raise MuseGenerationError("无法确认空白对话，已停止发送以免读取旧回复")
+        send_status = self._send_chat_once(prompt, epoch, stop_event)
+        if send_status != "dispatched":
+            log.warning("chat_send_unconfirmed account=%s", account_id)
+            raise MuseGenerationError("提示词发送未确认，已停止等待助手首字；请检查页面连接后重试")
 
-        t_sent = time.time()
+        t_sent = time.monotonic()
         deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + 40.0)
-        sent, last, stable = "", None, 0
+        first_token_limit = max(1.0, float(getattr(self.cfg, "chat_first_token_timeout", 90)))
+        first_token_deadline = min(deadline, t_sent + first_token_limit)
+        log.info("chat_submit_dispatched account=%s preparation_s=%.3f first_token_limit_s=%.1f total_limit_s=%d",
+                 account_id, t_sent - preparation_started,
+                 first_token_deadline - t_sent, timeout)
         got_first = False
+        cnt, cur, has_stop = base_agent, "", False
+        observed_submission = False
+        last_delivery = {}
+        next_delivery_check = t_sent
+        stalled_since = None
 
-        # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
-        while time.time() < first_token_deadline:
+        # The first-token budget measures first visible upstream text; it is
+        # separate from when the completed answer is committed downstream.
+        while time.monotonic() < first_token_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
-            if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
-                    try:
-                        tail = self.page.js("document.body.innerText.slice(-500)") or ""
-                    except Exception:
-                        tail = ""
-                    if "Still sending" in tail or "Connecting..." in tail:
-                        raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
+            if stop_event is not None and stop_event.is_set():
+                return
+            if not cur.strip() or (cnt <= base_agent and cur == base_text):
+                now = time.monotonic()
+                if now >= next_delivery_check:
+                    last_delivery = self._chat_page_state()
+                    next_delivery_check = now + 0.5
+                    if last_delivery["epoch"] != epoch:
+                        raise MuseGenerationError("发送后页面已重新加载，投递状态未知，已停止自动重发")
+                    if last_delivery["users"] > 1:
+                        raise MuseGenerationError("发送后出现多个用户消息，无法确认当前回复")
+                    if last_delivery["users"] == 1 or last_delivery["stop"] or last_delivery["assistants"]:
+                        if not observed_submission:
+                            log.info("chat_submission_observed account=%s elapsed_s=%.3f users=%d assistant_total=%d generating=%s backend_ack=unknown",
+                                     account_id, now-t_sent, last_delivery["users"], last_delivery["assistants"], last_delivery["stop"])
+                        observed_submission = True
+                    # Explicit UI errors are not inferred from user/assistant
+                    # message text. Do not retry an ambiguously accepted send.
+                    if last_delivery["failed"]:
+                        raise MuseGenerationError("Muse 页面报告发送失败，投递状态未知，已停止自动重发")
+                    if last_delivery["connecting"] or last_delivery["pending"]:
+                        if stalled_since is None:
+                            stalled_since = now
+                        elif now - stalled_since >= 14.0:
+                            raise MuseGenerationError("Muse 连接或投递等待持续异常，已停止等待；未自动重发")
+                    else:
+                        stalled_since = None
+                    if not observed_submission and now - t_sent >= 10.0:
+                        log.warning("chat_submission_unobserved account=%s wait_s=%.3f input_present=%s input_empty=%s users=%d assistant_total=%d generating=%s",
+                                    account_id, now-t_sent, last_delivery["input_present"], last_delivery["input_empty"],
+                                    last_delivery["users"], last_delivery["assistants"], last_delivery["stop"])
+                        raise MuseGenerationError("点击后未观察到用户消息或生成状态，投递状态未知，已停止自动重发")
                 continue
 
-            delta = cur[len(sent):] if cur.startswith(sent) else cur
-            if delta:
-                sent = cur
-                yield delta
-                last = cur
-                got_first = True
+            self.chat_response_started = True
+            if time.monotonic() >= first_token_deadline:
                 break
+            if cnt != 1:
+                raise MuseGenerationError("无法确认当前助手回复，已停止输出")
+            log.info("chat_first_token_received account=%s wait_s=%.3f poll_errors=%d",
+                     account_id, time.monotonic() - t_sent, local.chat_poll_errors)
+            got_first = True
+            break
 
         if not got_first:
+            log.warning("chat_first_token_timeout account=%s wait_s=%.3f limit_s=%.1f generating=%s "
+                        "assistant_bubbles=%d poll_errors=%d last_poll_error=%s users=%s assistant_total=%s local_submission_observed=%s",
+                        account_id, time.monotonic() - t_sent, first_token_deadline - t_sent,
+                        has_stop, cnt, local.chat_poll_errors, local.chat_poll_error_type,
+                        last_delivery.get("users"), last_delivery.get("assistants"), observed_submission)
             raise MuseGenerationError("等待助手首字响应超时")
 
-        # 2. 持续捕获增量文本
-        while time.time() < deadline:
+        # A single missing Stop sample is not completion. Require the same
+        # nonempty snapshot and no Stop continuously for one second. Empty/error
+        # observations and resumed generation invalidate that candidate.
+        response_count = cnt
+        last = cur
+        settled_since = time.monotonic() if not has_stop else None
+        while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
-            if not cur:
+            if stop_event is not None and stop_event.is_set():
+                return
+            if not cur.strip():
+                settled_since = None
                 continue
-
-            if cur != last:
-                delta = cur[len(sent):] if cur.startswith(sent) else cur
-                if delta:
-                    sent = cur
-                    yield delta
-                last, stable = cur, 0
+            if cnt != response_count:
+                # Only the last bubble is currently sampled. Returning it after
+                # a bubble switch could silently omit earlier answer text.
+                raise MuseGenerationError("助手回复气泡发生切换，无法确认完整回答，已停止输出")
+            if has_stop:
+                settled_since = None
+            elif cur != last or settled_since is None:
+                settled_since = time.monotonic()
             else:
-                stable += 1
-                # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
-                if not has_stop and stable >= 3:
+                if time.monotonic() - settled_since >= 1.0:
+                    if time.monotonic() >= deadline:
+                        break
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    log.info("chat_answer_committed account=%s elapsed_s=%.3f chars=%d poll_errors=%d sha256=%s",
+                             account_id, time.monotonic() - t_sent, len(cur), local.chat_poll_errors,
+                             hashlib.sha256(cur.encode("utf-8")).hexdigest())
+                    yield cur
                     return
-                # Stop 仍在时继续等待，由请求截止时间或客户端取消终止任务。
+            last = cur
 
         raise MuseGenerationError("等待助手回复超时")
 

@@ -102,6 +102,8 @@ class Config:
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))
     video_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_TIMEOUT", "600")))
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
+    chat_first_token_timeout: int = field(
+        default_factory=lambda: max(1, int(_env("MUSE2API_CHAT_FIRST_TOKEN_TIMEOUT", "90"))))
     max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "2"))))
 
     # 工具调用（function calling）协议适配开关，**默认关闭**。
