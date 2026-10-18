@@ -30,6 +30,10 @@ class MuseGenerationError(Exception):
     pass
 
 
+class RefImageSafetyError(ValueError):
+    pass
+
+
 class SyntheticStore:
     def __init__(self, cfg):
         self.accounts = [{"id": "synthetic-a", "enabled": True,
@@ -158,6 +162,9 @@ class ChatLifecycleTests(unittest.TestCase):
         engine = types.ModuleType("engine")
         engine.ESSENTIAL_COOKIES = ()
         engine.MuseAuthError, engine.MuseGenerationError = MuseAuthError, MuseGenerationError
+        # Keep the synthetic engine compatible with the reference-image safety
+        # exception imported by the API when that change is combined with this PR.
+        engine.RefImageSafetyError = RefImageSafetyError
         engine.MuseEngine = SyntheticEngine
         store = types.ModuleType("store")
         store.Store = SyntheticStore

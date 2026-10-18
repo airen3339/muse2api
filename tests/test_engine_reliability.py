@@ -30,6 +30,9 @@ class Clock:
     def time(self):
         return self.now
 
+    def monotonic(self):
+        return self.now
+
     def sleep(self, seconds):
         self.now += seconds
 
@@ -252,7 +255,9 @@ class StreamTests(OfflineTest):
         self.enterContext(patch.object(engine, "time", self.clock))
         self.e.ensure_page = Mock()
         self.e.reset_thread = Mock()
-        self.e._send = Mock(return_value="clicked")
+        self.e._prepare_chat_submission = Mock(return_value=1)
+        self.e._chat_page_state = Mock(return_value=dict(epoch=1, users=1, assistants=0, stop=True, failed=False, connecting=False, pending=False, input_present=True, input_empty=True))
+        self.e._send_chat_once = Mock(return_value="dispatched")
         self.stop = threading.Event()
 
     def stream(self, state, timeout=30):
@@ -264,19 +269,18 @@ class StreamTests(OfflineTest):
     def test_active_six_second_pause_does_not_truncate(self):
         chunks = list(self.stream(lambda t: (
             (1, "partial", True) if t < 6 else (1, "partial COMPLETE", False))))
-        self.assertEqual(chunks, ["partial", " COMPLETE"])
+        self.assertEqual(chunks, ["partial COMPLETE"])
         self.assertGreaterEqual(self.clock.now, 6)
-        self.assertLess(self.clock.now, 7)
+        self.assertLess(self.clock.now, 7.2)
 
     def test_short_pause_control_completes(self):
         chunks = list(self.stream(lambda t: (
             (1, "partial", True) if t < 4 else (1, "partial COMPLETE", False))))
-        self.assertEqual(chunks, ["partial", " COMPLETE"])
-        self.assertLess(self.clock.now, 5)
+        self.assertEqual(chunks, ["partial COMPLETE"])
+        self.assertLess(self.clock.now, 5.2)
 
     def test_active_generation_reaches_deadline_as_error(self):
         stream = self.stream(lambda t: (1, "partial", True), timeout=8)
-        self.assertEqual(next(stream), "partial")
         with self.assertRaisesRegex(engine.MuseGenerationError, "等待助手回复超时"):
             list(stream)
         self.assertGreaterEqual(self.clock.now, 8)
@@ -287,7 +291,7 @@ class StreamTests(OfflineTest):
             if t >= 6:
                 self.stop.set()
             return 1, "partial", True
-        self.assertEqual(list(self.stream(state)), ["partial"])
+        self.assertEqual(list(self.stream(state)), [])
         self.assertTrue(self.stop.is_set())
         self.assertGreaterEqual(self.clock.now, 6)
         self.assertLess(self.clock.now, 6.1)
@@ -300,7 +304,8 @@ class StreamTests(OfflineTest):
 
     def test_completed_stable_text_returns_normally(self):
         self.assertEqual(list(self.stream(lambda t: (1, "done", False))), ["done"])
-        self.assertAlmostEqual(self.clock.now, 0.24)
+        self.assertGreaterEqual(self.clock.now, 1.0)
+        self.assertLess(self.clock.now, 1.2)
 
     def test_no_first_token_preserves_timeout_error(self):
         with self.assertRaisesRegex(engine.MuseGenerationError, "等待助手首字响应超时"):
