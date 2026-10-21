@@ -1,7 +1,7 @@
 [
   {
     "id": "example_acc_01",
-    "label": "演示账号01",
+    "label": "Demo Account 01",
     "created_at": 1790140000,
     "last_used_at": 1790140000,
     "last_status": "ok",

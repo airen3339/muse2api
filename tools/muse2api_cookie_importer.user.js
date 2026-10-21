@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Muse2API Cookie 导入助手
+// @name         Muse2API Cookie Importer
 // @namespace    https://github.com/czg86389-hub/muse2api
 // @version      1.1.0
-// @description  在 muse.ai 网页上一键导出并推送核心 Cookie 至 muse2api 账号池，支持现代化悬浮面板、状态指示与剪贴板备份
+// @description  Export the core cookies on muse.ai and push them to the muse2api account pool in one click, with a floating panel, status indicator and clipboard backup
 // @author       MUSE2API Contributors
 // @match        https://muse.ai/*
 // @match        https://*.muse.ai/*
@@ -125,7 +125,7 @@
 
     if (btnEl) {
       btnEl.disabled = true;
-      btnEl.innerHTML = '<span style="opacity:0.8">⏳ 提取中…</span>';
+      btnEl.innerHTML = '<span style="opacity:0.8">⏳ Extracting…</span>';
     }
 
     try {
@@ -133,13 +133,13 @@
       const names = Object.keys(cookies);
 
       if (!names.length) {
-        showToast('未检测到 muse.ai Cookie，请确保已登录账号！', 'err');
+        showToast('No muse.ai cookies detected, make sure you are logged in!', 'err');
         return;
       }
 
       const missing = ESSENTIAL.filter(n => !(n in cookies));
       if (missing.length) {
-        showToast(`读到 ${names.length} 条 Cookie，但缺核心项：${missing.join(', ')}。请刷新页面重试。`, 'err');
+        showToast(`Read ${names.length} cookies, but core items are missing: ${missing.join(', ')}. Please refresh the page and retry.`, 'err');
         return;
       }
 
@@ -149,11 +149,11 @@
       }
 
       if (!base) {
-        showToast('✓ 完整 Cookie 已复制到剪贴板！请在上方配置服务地址以启用一键入库。', 'ok');
+        showToast('✓ Full cookie string copied to clipboard! Configure the service URL above to enable one-click import.', 'ok');
         return;
       }
 
-      if (btnEl) btnEl.innerHTML = '<span style="opacity:0.8">🚀 推送至服务…</span>';
+      if (btnEl) btnEl.innerHTML = '<span style="opacity:0.8">🚀 Pushing to service…</span>';
 
       const headers = { 'Content-Type': 'application/json' };
       if (key) {
@@ -185,24 +185,24 @@
       try { data = JSON.parse(txt); } catch (_) {}
 
       if (r.status === 401) {
-        showToast('推送失败：API Key 错误 (401)', 'err');
+        showToast('Push failed: invalid API Key (401)', 'err');
         return;
       }
       if (!r.ok) {
-        showToast(`推送失败 (HTTP ${r.status})：${txt.slice(0, 80)}。已复制 Cookie 到剪贴板！`, 'err');
+        showToast(`Push failed (HTTP ${r.status}): ${txt.slice(0, 80)}. Cookies copied to clipboard!`, 'err');
         return;
       }
 
       const a = (data.added && data.added[0]) || {};
-      const expDate = a.expires_at ? new Date(a.expires_at * 1000).toLocaleDateString() : '有效';
-      showToast(`✓ 账号成功导入 muse2api！\nID: ${a.id || '?'}\n有效期至: ${expDate}`, 'ok');
+      const expDate = a.expires_at ? new Date(a.expires_at * 1000).toLocaleDateString() : 'valid';
+      showToast(`✓ Account imported into muse2api!\nID: ${a.id || '?'}\nValid until: ${expDate}`, 'ok');
       updateStatusBadge();
     } catch (e) {
-      showToast(`请求异常：${e.message || e}。已自动复制 Cookie 到剪贴板！`, 'err');
+      showToast(`Request error: ${e.message || e}. Cookies copied to clipboard automatically!`, 'err');
     } finally {
       if (btnEl) {
         btnEl.disabled = false;
-        btnEl.innerHTML = '⚡ 一键推送至账号池';
+        btnEl.innerHTML = '⚡ Push to account pool';
       }
     }
   }
@@ -213,10 +213,10 @@
     const st = await checkSessionStatus();
     if (st.hasCore) {
       badge.style.color = '#22c55e';
-      badge.textContent = `✓ 登录态完整 (${st.count} 项)`;
+      badge.textContent = `✓ Session complete (${st.count} items)`;
     } else {
       badge.style.color = '#f59e0b';
-      badge.textContent = `⚠ 登录态未就绪`;
+      badge.textContent = `⚠ Session not ready`;
     }
   }
 
@@ -245,33 +245,33 @@
                   box-shadow:0 20px 50px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(96, 165, 250, 0.25);
                   backdrop-filter:blur(16px); font-size:13px; line-height:1.4;">
         
-        <!-- 头部 -->
+        <!-- Header -->
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid #1e293b;">
           <div style="display:flex; align-items:center; gap:8px;">
             <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#38bdf8; box-shadow:0 0 10px #38bdf8;"></span>
-            <b style="font-size:15px; color:#f1f5f9; letter-spacing:0.3px;">muse2api 导入面板</b>
+            <b style="font-size:15px; color:#f1f5f9; letter-spacing:0.3px;">muse2api Import Panel</b>
             <span style="font-size:11px; background:#1e293b; color:#94a3b8; padding:1px 6px; border-radius:6px;">v1.1</span>
           </div>
           <button id="muse-close-btn" style="background:transparent; border:none; color:#64748b; font-size:18px; cursor:pointer; padding:0 4px; line-height:1;">✕</button>
         </div>
 
-        <!-- 状态指示栏 -->
+        <!-- Status bar -->
         <div style="background:#0f172a; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
-          <span style="font-size:12px; color:#94a3b8;">当前网页会话</span>
-          <span id="muse-status-tag" style="font-size:12px; font-weight:600; color:#94a3b8;">检测中…</span>
+          <span style="font-size:12px; color:#94a3b8;">Current page session</span>
+          <span id="muse-status-tag" style="font-size:12px; font-weight:600; color:#94a3b8;">Checking…</span>
         </div>
 
-        <!-- 表单配置项（直接内嵌输入框，自动记忆） -->
+        <!-- Settings form (inline inputs, remembered automatically) -->
         <div style="margin-bottom:12px;">
-          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">服务地址 (Base URL)</div>
-          <input id="muse-cfg-base" type="text" placeholder="如 https://muse.yourdomain.com 或 http://localhost:18610"
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">Service URL (Base URL)</div>
+          <input id="muse-cfg-base" type="text" placeholder="e.g. https://muse.yourdomain.com or http://localhost:18610"
                  value="${cfg.base || ''}"
                  style="width:100%; box-sizing:border-box; padding:8px 11px; background:#0b1120; border:1px solid #334155;
                         border-radius:8px; color:#f1f5f9; font-size:12px; font-family:monospace; outline:none; transition:border-color 0.2s;">
         </div>
 
         <div style="margin-bottom:12px;">
-          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">API Key（若服务未开鉴权可留空）</div>
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">API Key (leave empty if the service has no auth)</div>
           <input id="muse-cfg-key" type="password" placeholder="m2a_..."
                  value="${cfg.key || ''}"
                  style="width:100%; box-sizing:border-box; padding:8px 11px; background:#0b1120; border:1px solid #334155;
@@ -279,38 +279,38 @@
         </div>
 
         <div style="margin-bottom:16px;">
-          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">账号标签 (可选显示名称)</div>
-          <input id="muse-cfg-label" type="text" placeholder="如 acc-01（留空自动生成）"
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">Account label (optional display name)</div>
+          <input id="muse-cfg-label" type="text" placeholder="e.g. acc-01 (auto-generated if empty)"
                  value="${cfg.label || ''}"
                  style="width:100%; box-sizing:border-box; padding:8px 11px; background:#0b1120; border:1px solid #334155;
                         border-radius:8px; color:#f1f5f9; font-size:12px; outline:none;">
         </div>
 
-        <!-- 动作操作区 -->
+        <!-- Actions -->
         <div style="display:flex; flex-direction:column; gap:8px;">
           <button id="muse-action-push" style="width:100%; padding:10px 0; border:none; border-radius:10px;
                   background:linear-gradient(135deg, #0284c7, #2563eb); color:#fff;
                   font-weight:600; font-size:13px; cursor:pointer; box-shadow:0 4px 14px rgba(37, 99, 235, 0.4);
                   transition:all 0.2s;">
-            ⚡ 一键推送至账号池
+            ⚡ Push to account pool
           </button>
 
           <div style="display:flex; gap:8px;">
             <button id="muse-action-copy" style="flex:1; padding:7px 0; border:1px solid #334155; border-radius:8px;
                     background:#0f172a; color:#cbd5e1; font-size:12px; cursor:pointer; transition:all 0.2s;">
-              📋 仅复制 Cookie
+              📋 Copy cookies only
             </button>
             <button id="muse-action-save" style="flex:1; padding:7px 0; border:1px solid #334155; border-radius:8px;
                     background:#0f172a; color:#cbd5e1; font-size:12px; cursor:pointer; transition:all 0.2s;">
-              💾 保存配置
+              💾 Save settings
             </button>
           </div>
         </div>
 
-        <!-- 底部提示 -->
+        <!-- Footer hint -->
         <div style="margin-top:14px; padding-top:10px; border-top:1px solid #1e293b; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#64748b;">
-          <span>配置将自动保存于浏览器本地</span>
-          <span>按 Esc 或右上角关闭</span>
+          <span>Settings are saved locally in your browser</span>
+          <span>Close with Esc or the top-right button</span>
         </div>
       </div>
     `;
@@ -318,7 +318,7 @@
     document.body.appendChild(panel);
     updateStatusBadge();
 
-    // 绑定事件与自动保存
+    // Bind events and auto-save
     const baseIn = document.getElementById('muse-cfg-base');
     const keyIn = document.getElementById('muse-cfg-key');
     const labelIn = document.getElementById('muse-cfg-label');
@@ -340,7 +340,7 @@
     document.getElementById('muse-close-btn').onclick = () => panel.remove();
     document.getElementById('muse-action-save').onclick = () => {
       saveInputs();
-      showToast('✓ 配置已保存！', 'ok');
+      showToast('✓ Settings saved!', 'ok');
     };
 
     document.getElementById('muse-action-copy').onclick = async () => {
@@ -348,9 +348,9 @@
       const str = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
       if (str) {
         if (typeof GM_setClipboard === 'function') GM_setClipboard(str);
-        showToast('✓ 完整 Cookie 已复制到剪贴板！', 'ok');
+        showToast('✓ Full cookie string copied to clipboard!', 'ok');
       } else {
-        showToast('未检测到任何 Cookie！', 'err');
+        showToast('No cookies detected!', 'err');
       }
     };
 
@@ -370,7 +370,7 @@
                   color:#fff; display:flex; align-items:center; justify-content:center;
                   cursor:pointer; box-shadow:0 8px 24px rgba(37, 99, 235, 0.45); font-size:18px;
                   user-select:none; transition:transform 0.2s, box-shadow 0.2s;"
-           title="点击展开 muse2api 导入面板"
+           title="Click to open the muse2api import panel"
            onmouseover="this.style.transform='scale(1.08)'"
            onmouseout="this.style.transform='scale(1)'">
         ⚡
@@ -381,8 +381,8 @@
   }
 
   if (typeof GM_registerMenuCommand === 'function') {
-    GM_registerMenuCommand('🚀 打开 muse2api 导入面板', togglePanel);
-    GM_registerMenuCommand('⚡ 直接一键推送当前账号', () => executePush());
+    GM_registerMenuCommand('🚀 Open muse2api import panel', togglePanel);
+    GM_registerMenuCommand('⚡ Push current account now', () => executePush());
   }
 
   if (document.readyState === 'loading') {

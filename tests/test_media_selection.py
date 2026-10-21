@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home(), ign
   video=engine._wait_attachment('',3,'video')
   engine.attachments=lambda:[{'src':'poster_only.png','tid':'image','hasVideo':False,'w':32,'h':32}]
   fallback_video_rejected=engine._wait_attachment('',1,'video') is None
-  # tid 已标 presentation-video，但尚无 <video>/vSrc：封面静帧不得当作命中
+  # tid is already tagged presentation-video but there is no <video>/vSrc yet: the cover still must not count as a hit
   engine.attachments=lambda:[{'src':'cover.jpg','vSrc':'','tid':'hatch-chat-attachment-presentation-video','hasVideo':False,'w':1280,'h':720}]
   tid_video_cover_rejected=engine._wait_attachment('',1,'video') is None
   page.js('''document.body.innerHTML='<button aria-label="Download" onclick="window.wrongDownload=true">Download</button>';window.wrongDownload=false;''')

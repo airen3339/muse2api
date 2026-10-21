@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Mail.tm 临时邮箱：申请地址 + 轮询取验证码。
+"""Mail.tm disposable mailbox: create an address and poll for the verification code.
 
-用途：muse.ai 登录要邮箱验证码时，跑这个脚本拿到一个临时邮箱地址，
-      填进登录页，脚本会把收到的验证码打印出来。
+Purpose: when muse.ai login asks for an email verification code, run this script to get
+      a disposable email address, enter it on the login page, and the script prints the code it receives.
 
-零依赖（纯标准库）。用法：
-    python3 mailtm_otp.py                # 申请新地址并开始轮询
-    python3 mailtm_otp.py --addr a@b.c --pass xxx   # 复用已有地址
-    python3 mailtm_otp.py --timeout 600  # 轮询时长（秒），默认 900
+Zero dependencies (standard library only). Usage:
+    python3 mailtm_otp.py                # create a new address and start polling
+    python3 mailtm_otp.py --addr a@b.c --pass xxx   # reuse an existing address
+    python3 mailtm_otp.py --timeout 600  # polling duration (seconds), default 900
 """
 import argparse, json, random, re, string, sys, time, urllib.request, urllib.error
 
@@ -15,7 +15,7 @@ API = "https://api.mail.tm"
 
 
 def req(path, method="GET", token=None, body=None):
-    """发一个请求，返回解析后的 JSON。"""
+    """Send a request and return the parsed JSON."""
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(API + path, data=data, method=method)
     r.add_header("Content-Type", "application/json")
@@ -32,9 +32,9 @@ def req(path, method="GET", token=None, body=None):
 
 
 def new_account():
-    """申请一个新地址，返回 (address, password, token)。"""
+    """Create a new address and return (address, password, token)."""
     d = req("/domains")
-    domains = d["hydra:member"] if isinstance(d, dict) else d  # 新版返回数组，旧版 hydra 包装
+    domains = d["hydra:member"] if isinstance(d, dict) else d  # newer API returns an array, older wraps it in hydra
     domain = next(x["domain"] for x in domains if x.get("isActive", True))
     user = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
     addr, pwd = f"{user}@{domain}", "".join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -51,9 +51,9 @@ CODE_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
 
 
 def poll(token, timeout):
-    """轮询新邮件，发现验证码就打印。返回验证码或 None。"""
+    """Poll for new mail and print the verification code when found. Returns the code or None."""
     seen, deadline = set(), time.time() + timeout
-    print(f"[*] 开始轮询收件箱（最多 {timeout}s，Ctrl-C 可停）\n")
+    print(f"[*] Polling inbox (up to {timeout}s, Ctrl-C to stop)\n")
     while time.time() < deadline:
         try:
             r = req("/messages?page=1", token=token)
@@ -68,17 +68,17 @@ def poll(token, timeout):
             frm = (full.get("from") or {}).get("address", "?")
             subj = full.get("subject", "")
             body = full.get("text") or full.get("intro") or ""
-            print(f"[+] 新邮件  来自 {frm}\n    主题：{subj}")
+            print(f"[+] New mail  from {frm}\n    Subject: {subj}")
             codes = CODE_RE.findall(f"{subj}\n{body}")
-            print(f"    正文：{body.strip()[:500]}")
+            print(f"    Body: {body.strip()[:500]}")
             if codes:
-                print(f"\n>>> 验证码：{codes[0]}\n")
+                print(f"\n>>> Verification code: {codes[0]}\n")
                 return codes[0]
-            print("    （未识别到验证码，继续等待…）\n")
+            print("    (No verification code found, still waiting...)\n")
         left = int(deadline - time.time())
-        print(f"    等待中… 剩余 {left}s", end="\r", flush=True)
+        print(f"    Waiting... {left}s left", end="\r", flush=True)
         time.sleep(3)
-    print("\n[!] 超时，未收到验证码。")
+    print("\n[!] Timed out, no verification code received.")
     return None
 
 
@@ -89,11 +89,11 @@ def main():
     a = ap.parse_args()
     if a.addr and a.pwd:
         addr, pwd, token = a.addr, a.pwd, login(a.addr, a.pwd)
-        print(f"[*] 复用已有地址：{addr}")
+        print(f"[*] Reusing existing address: {addr}")
     else:
         addr, pwd, token = new_account()
-        print(f"[*] 已申请新地址：{addr}\n    密码：{pwd}（复用需带上）")
-    print(f"\n=== 把下面这个地址填进 muse.ai 登录页 ===\n    {addr}\n")
+        print(f"[*] Created new address: {addr}\n    Password: {pwd} (needed to reuse it)")
+    print(f"\n=== Enter this address on the muse.ai login page ===\n    {addr}\n")
     code = poll(token, a.timeout)
     sys.exit(0 if code else 1)
 
@@ -102,4 +102,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[*] 已停止。")
+        print("\n[*] Stopped.")

@@ -1,9 +1,9 @@
-/* Muse2API Cookie 导入 —— 读取 muse.ai 的 cookie 并 POST 到 muse2api 服务。
+/* Muse2API Cookie Import — reads muse.ai cookies and POSTs them to the muse2api service.
  *
- * 关键点：用 chrome.cookies 而不是 document.cookie。
- * muse.ai 的 4 条核心 cookie（hatch_sess / hatch_gw / hatch_vml /
- * hatch_native_auth_device）都带 httpOnly，网页 JS 读不到，
- * 只有浏览器扩展的 cookies 接口能拿到。
+ * Key point: use chrome.cookies instead of document.cookie.
+ * The 4 core muse.ai cookies (hatch_sess / hatch_gw / hatch_vml /
+ * hatch_native_auth_device) are all httpOnly, so page JS cannot read them;
+ * only the browser extension cookies API can access them.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -17,7 +17,7 @@ function log(html, cls) {
   el.innerHTML = cls ? `<span class="${cls}">${html}</span>` : html;
 }
 
-/* 规范化服务地址：去掉结尾斜杠和 /v1 后缀 */
+/* Normalize the service address: strip trailing slashes and the /v1 suffix */
 function normBase(v) {
   let s = (v || '').trim();
   if (!s) return '';
@@ -33,7 +33,7 @@ async function loadCfg() {
   if (c.base) $('base').value = c.base;
   if (c.key) $('key').value = c.key;
   if (c.label) $('label').value = c.label;
-  // 没有配置过就尝试从当前标签页猜一个（用户在管理页上时）
+  // If not configured yet, try to guess from the current tab (when the user is on the admin page)
   if (!c.base) {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -43,7 +43,7 @@ async function loadCfg() {
         const k = new URLSearchParams(u.search).get('key');
         if (k) $('key').value = k;
       }
-    } catch (e) { /* 忽略 */ }
+    } catch (e) { /* ignore */ }
   }
 }
 
@@ -74,27 +74,27 @@ async function run() {
   const key = $('key').value.trim();
   const label = $('label').value.trim();
 
-  if (!base) return log('请先填服务地址', 'bad');
-  if (!key) return log('请先填 API Key', 'bad');
+  if (!base) return log('Please enter the service address first', 'bad');
+  if (!key) return log('Please enter the API Key first', 'bad');
 
   $('go').disabled = true;
-  log('正在读取 muse.ai 的 Cookie…');
+  log('Reading muse.ai cookies…');
 
   try {
     const { cookies, expires } = await grabCookies();
     const names = Object.keys(cookies);
     if (!names.length) {
-      return log('没读到 muse.ai 的 Cookie。\n请先在这个浏览器里打开并登录 '
-                 + 'https://muse.ai/ ，再回来点一次。', 'bad');
+      return log('No muse.ai cookies found.\nPlease open and log in to '
+                 + 'https://muse.ai/ in this browser first, then click again.', 'bad');
     }
     const missing = ESSENTIAL.filter((n) => !(n in cookies));
     if (missing.length) {
-      log(`读到 ${names.length} 条 Cookie，但缺核心项：${missing.join('、')}\n`
-          + '说明这个浏览器还没登录成功。请登录到能看到聊天界面再试。', 'warn');
+      log(`Found ${names.length} cookies, but core items are missing: ${missing.join(', ')}\n`
+          + 'This browser is not fully logged in yet. Log in until you can see the chat interface, then try again.', 'warn');
       return;
     }
 
-    log(`读到 ${names.length} 条 Cookie，正在上传到 ${base} …`);
+    log(`Found ${names.length} cookies, uploading to ${base} …`);
 
     const r = await fetch(base + '/admin/accounts', {
       method: 'POST',
@@ -110,25 +110,25 @@ async function run() {
     try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
 
     if (r.status === 401) {
-      return log('API Key 不对（服务返回 401）。\n'
-                 + '请到管理页「账号池」页顶部复制正确的 API Key。', 'bad');
+      return log('Invalid API Key (the service returned 401).\n'
+                 + 'Copy the correct API Key from the top of the "Account Pool" tab in the admin page.', 'bad');
     }
     if (!r.ok) {
-      return log(`导入失败：HTTP ${r.status}\n${text.slice(0, 300)}`, 'bad');
+      return log(`Import failed: HTTP ${r.status}\n${text.slice(0, 300)}`, 'bad');
     }
 
     const a = (data.added && data.added[0]) || {};
     await saveCfg();
-    log(`✓ 导入成功\n账号标签：${a.label || label || '(自动)'}\n`
-        + `账号 ID：${a.id || '?'}\nCookie 条数：${a.cookie_count || names.length}\n`
-        + `有效期到：${a.expires_at ? new Date(a.expires_at * 1000).toLocaleString() : '未知'}\n`
-        + (data.warning ? `\n注意：${data.warning}` : ''), 'ok');
+    log(`✓ Import succeeded\nAccount label: ${a.label || label || '(auto)'}\n`
+        + `Account ID: ${a.id || '?'}\nCookie count: ${a.cookie_count || names.length}\n`
+        + `Expires at: ${a.expires_at ? new Date(a.expires_at * 1000).toLocaleString() : 'unknown'}\n`
+        + (data.warning ? `\nNote: ${data.warning}` : ''), 'ok');
   } catch (e) {
-    log('出错了：' + (e && e.message ? e.message : String(e))
-        + '\n\n常见原因：\n'
-        + '· 服务地址填错或服务没启动\n'
-        + '· 这个地址不是 https（或证书不被信任）\n'
-        + '· 浏览器拦截了跨域请求', 'bad');
+    log('Error: ' + (e && e.message ? e.message : String(e))
+        + '\n\nCommon causes:\n'
+        + '· Wrong service address, or the service is not running\n'
+        + '· The address is not https (or the certificate is not trusted)\n'
+        + '· The browser blocked the cross-origin request', 'bad');
   } finally {
     $('go').disabled = false;
   }
