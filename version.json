@@ -12,5 +12,16 @@
     "额度查询适配简体中文、繁体中文和英文界面，兼容全角字符、小数百分比及 0% 用量。",
     "修复额度面板定位与关闭流程；未读到有效额度时保留旧缓存，不再把无效结果当成实时数据。",
     "管理页针对非 JSON 错误显示明确的 HTTP 状态提示，避免泄露代理返回的 HTML 错误页。"
+  ],
+  "highlights_en": [
+    "Fixed quota reads leaking between accounts: each quota query is now bound to that account's browser page, so accounts no longer show each other's balance and usage.",
+    "When reading the quota fails or returns no valid data, the old cache is kept and the failure is reported clearly, instead of treating invalid results as live quota.",
+    "Fixed false keep-alive success: a wake request being accepted is now distinguished from the VM actually running, and wake-up is only reported as successful once the re-checked state is RUNNING.",
+    "The admin page shows when the quota was last checked and warns when it is stale; account tests report session validity and quota read status separately.",
+    "Maintenance probes no longer update the last-used time, and background keep-alive only runs when renewal is needed, so maintenance traffic is not counted as user activity or triggers keep-alive too often.",
+    "Added offline regression tests covering per-account quota isolation and VM wake-state confirmation.",
+    "Quota reading now supports Simplified Chinese, Traditional Chinese and English page layouts, including full-width characters, decimal percentages and 0% usage.",
+    "Fixed locating and closing the quota panel; when no valid quota is read, the old cache is kept and invalid results are no longer treated as live data.",
+    "For non-JSON errors the admin page now shows a clear HTTP status hint instead of leaking the proxy's HTML error page."
   ]
 }

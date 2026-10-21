@@ -2232,6 +2232,7 @@ def _check_update_sync(force: bool = False) -> dict:
 
     remote_version = local_version
     highlights = list(local_ver_obj.get("highlights") or [])
+    highlights_en = list(local_ver_obj.get("highlights_en") or [])
     try:
         rv = requests.get(
             f"https://raw.githubusercontent.com/czg86389-hub/muse2api/main/version.json?t={int(now)}",
@@ -2243,6 +2244,9 @@ def _check_update_sync(force: bool = False) -> dict:
                 remote_version = str(rvj.get("version") or remote_version)
                 if rvj.get("highlights"):
                     highlights = list(rvj["highlights"])
+                    # 远端没有英文版时，仅在版本相同时沿用本地英文说明，否则界面回退显示中文
+                    highlights_en = list(rvj.get("highlights_en")
+                                         or (highlights_en if remote_version == local_version else []))
     except Exception:
         pass
 
@@ -2312,6 +2316,7 @@ def _check_update_sync(force: bool = False) -> dict:
         "has_update": has_update,
         "up_to_date": not has_update and bool(remote_sha or remote_version),
         "highlights": highlights,
+        "highlights_en": highlights_en,
         "recent_commits": recent_commits,
         "checked_at": int(now),
     }
