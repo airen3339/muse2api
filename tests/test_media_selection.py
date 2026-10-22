@@ -11,7 +11,8 @@ spec=importlib.util.spec_from_file_location('candidate',source)
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 from types import SimpleNamespace
 # snap Chromium needs a non-hidden writable profile under HOME, not /tmp.
-with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home(), ignore_cleanup_errors=True) as tmp:
+temp_root = Path(os.environ.get('MUSE2API_TEST_TEMP_ROOT') or Path.home())
+with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=temp_root, ignore_cleanup_errors=True) as tmp:
  with socket.socket() as sock:
   sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
  chromium=os.environ.get('MUSE2API_CHROMIUM') or next((shutil.which(n) for n in ('chromium','chromium-browser','google-chrome') if shutil.which(n)),None)

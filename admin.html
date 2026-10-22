@@ -1701,7 +1701,7 @@ async function keepaliveOne(id){
   toast('正在为该账号执行会话静默续期…');
   try{
     const r = await api(`/admin/accounts/${id}/keepalive`, {method:'POST'});
-    toast(r.ok ? `✓ 账号保活成功，新到期时间已更新` : `✗ 保活失败: ${r.error||'未知错误'}`, r.ok ? 'ok' : 'bad');
+    toast(r.ok ? `✓ 账号保活成功，会话状态已确认` : `✗ 保活失败: ${r.error||'未知错误'}`, r.ok ? 'ok' : 'bad');
     loadPool();
   }catch(e){ toast('保活失败：' + e.message, 'bad'); }
 }
@@ -1715,7 +1715,20 @@ async function keepaliveAll(){
     if (r.status === 'busy') {
       toast('保活任务正在后台运行中，请稍候查看', 'warn');
     } else {
-      toast(`✓ 成功保活 ${r.refreshed_count || 0} 个账号，跳过 ${r.skipped_count || 0} 个`, 'ok');
+      const refreshed = Array.isArray(r.refreshed) ? r.refreshed : [];
+      const okCount = refreshed.filter(x => x && x.ok === true).length;
+      const failCount = refreshed.length - okCount;
+      if (!Array.isArray(r.refreshed) || r.refreshed_count !== refreshed.length) {
+        toast("保活返回结果不完整，无法确认本次成功数，请刷新账号状态", 'warn');
+      } else if (refreshed.length === 0) {
+        toast(`本次无需保活，已跳过 ${r.skipped_count || 0} 个账号`, 'ok');
+      } else if (failCount === 0) {
+        toast(`✓ 成功保活 ${okCount} 个账号，跳过 ${r.skipped_count || 0} 个`, 'ok');
+      } else if (okCount === 0) {
+        toast(`✗ 保活全部失败，共 ${failCount} 个账号，跳过 ${r.skipped_count || 0} 个`, 'bad');
+      } else {
+        toast(`⚠ 保活成功 ${okCount} 个，失败 ${failCount} 个，跳过 ${r.skipped_count || 0} 个`, 'warn');
+      }
     }
     loadPool();
   }catch(e){ toast('保活执行失败：' + e.message, 'bad'); }
