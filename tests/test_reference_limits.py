@@ -82,3 +82,98 @@ with tempfile.TemporaryDirectory() as home:
         raise AssertionError("more than four images were accepted")
 
 print("PASS: reference count, item, conflict, MIME and byte limits")
+
+
+
+class FakeJSONRequest:
+    headers = {"content-type": "application/json"}
+
+    def __init__(self, body):
+        self.body = body
+
+    async def json(self):
+        return self.body
+
+
+class FakeForm(dict):
+    def __init__(self, images, **values):
+        super().__init__(values)
+        self._images = images
+
+    def getlist(self, key):
+        return self._images if key == "image" else []
+
+
+class FakeMultipartRequest:
+    headers = {"content-type": "multipart/form-data; boundary=test"}
+
+    def __init__(self, form):
+        self.value = form
+        self.form_options = None
+
+    async def form(self, **kwargs):
+        self.form_options = kwargs
+        return self.value
+
+
+class FakeUpload:
+    def __init__(self, content, content_type="image/png"):
+        self.content = content
+        self.content_type = content_type
+        self.read_limit = None
+
+    async def read(self, limit=-1):
+        self.read_limit = limit
+        return self.content if limit < 0 else self.content[:limit]
+
+
+async def expect_endpoint_400(request, text):
+    try:
+        await app.images_edits(request, None)
+    except app.HTTPException as exc:
+        assert exc.status_code == 400
+        assert text in str(exc.detail), (text, exc.detail)
+    else:
+        raise AssertionError("invalid /v1/images/edits request was accepted")
+
+
+# Exercise the real endpoint path, not only its helper.
+for body, text in [
+    ({"prompt": "x", "async": True, "images": [None]}, "images[0]"),
+    ({"prompt": "x", "async": True, "images": ["new"], "image": "old"}, "不能"),
+    ({"prompt": "x", "async": True, "images": "not-an-array"}, "必须是数组"),
+]:
+    asyncio.run(expect_endpoint_400(FakeJSONRequest(body), text))
+
+captured = {}
+original_queue = app._queue_image
+try:
+    app._queue_image = lambda req, prompt, refs, *args, **kwargs: captured.update(refs=refs) or {"ok": True}
+    response = asyncio.run(app.images_edits(FakeJSONRequest({
+        "prompt": "x", "async": True, "images": ["data:image/png;base64,Zmlyc3Q=", {"url": "data:image/png;base64,c2Vjb25k"}]
+    }), None))
+    assert response == {"ok": True}
+    assert captured["refs"] == ["data:image/png;base64,Zmlyc3Q=",
+                            "data:image/png;base64,c2Vjb25k"]
+finally:
+    app._queue_image = original_queue
+
+oversized = FakeUpload(b"x" * (app.MAX_REFERENCE_IMAGE_BYTES + 1))
+oversized_request = FakeMultipartRequest(FakeForm(
+    [oversized], prompt="x", **{"async": True}))
+asyncio.run(expect_endpoint_400(oversized_request, "10 MiB"))
+assert oversized.read_limit == app.MAX_REFERENCE_IMAGE_BYTES + 1
+assert oversized_request.form_options == {
+    "max_files": app.MAX_REFERENCE_IMAGES, "max_fields": 20}
+
+chunk = b"x" * (app.MAX_REFERENCE_TOTAL_BYTES // 3 + 1)
+total_request = FakeMultipartRequest(FakeForm(
+    [FakeUpload(chunk), FakeUpload(chunk), FakeUpload(chunk)],
+    prompt="x", **{"async": True}))
+asyncio.run(expect_endpoint_400(total_request, "24 MiB"))
+
+count_request = FakeMultipartRequest(FakeForm(
+    ["x"] * (app.MAX_REFERENCE_IMAGES + 1), prompt="x"))
+asyncio.run(expect_endpoint_400(count_request, "最多 4 张"))
+
+print("PASS: endpoint JSON conflicts plus multipart count, per-file and total byte limits")

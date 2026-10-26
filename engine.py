@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import http.client
+import ipaddress
 import mimetypes
+import urllib.error
 import urllib.parse
 import urllib.request
 import json
@@ -18,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -49,6 +53,75 @@ class MuseGenerationError(RuntimeError):
 
 class MuseModelRefusalError(MuseGenerationError):
     """Muse completed the turn with text instead of the requested media."""
+
+
+class RefImageSafetyError(MuseGenerationError):
+    """A reference image source is forbidden by the configured input policy."""
+
+
+class _RefImageHTTPHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    def __init__(self, address: str):
+        super().__init__()
+        self.address = address
+
+    def _connection(self, host, connection_type, **kwargs):
+        connection = connection_type(host, **kwargs)
+
+        def create_connection(address, timeout, source_address):
+            return socket.create_connection((self.address, address[1]), timeout, source_address)
+
+        # Keep the original host for Host, TLS SNI and certificate validation;
+        # only the socket destination is pinned to the checked address.
+        connection._create_connection = create_connection
+        return connection
+
+    def http_open(self, req):
+        return self.do_open(lambda host, **kw: self._connection(
+            host, http.client.HTTPConnection, **kw), req)
+
+    def https_open(self, req):
+        return self.do_open(lambda host, **kw: self._connection(
+            host, http.client.HTTPSConnection, **kw), req)
+
+
+class _NoRefImageRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_public_ref_image(url: str):
+    """Open one public HTTP(S) URL with DNS rebinding and redirect checks."""
+    for _ in range(11):
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise RefImageSafetyError("参考图重定向仅允许有效的 http(s) URL")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+        checked = []
+        for address in addresses:
+            ip = ipaddress.ip_address(address[4][0])
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+                ip = ip.ipv4_mapped
+            if not ip.is_global:
+                raise RefImageSafetyError(
+                    "参考图地址被拒绝：仅允许公网地址；如确需私网抓取，请显式设置 "
+                    "MUSE2API_REF_IMAGE_PRIVATE_FETCH=1")
+            checked.append(str(ip))
+        if not checked:
+            raise urllib.error.URLError("参考图域名未解析到地址")
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRefImageRedirect(),
+            _RefImageHTTPHandler(checked[0]))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            return opener.open(req, timeout=20)
+        except urllib.error.HTTPError as exc:
+            location = exc.headers.get("Location")
+            if exc.code not in (301, 302, 303, 307, 308) or not location:
+                raise
+            exc.close()
+            url = urllib.parse.urljoin(url, location)
+    raise urllib.error.URLError("参考图重定向次数过多")
 
 
 class MuseEngine:
@@ -1206,9 +1279,8 @@ class MuseEngine:
                     return p
         return None
 
-    @staticmethod
-    def _normalize_image(img: str) -> tuple[str, str]:
-        """Normalize one image and reject non-images or oversized inputs."""
+    def _normalize_image(self, img: str) -> tuple[str, str]:
+        """Normalize one image and enforce source, MIME and size policy."""
         if not img:
             return "", "image/png"
         img = str(img).strip()
@@ -1233,17 +1305,33 @@ class MuseEngine:
             except (binascii.Error, ValueError) as exc:
                 raise MuseGenerationError("参考图 Data URL 编码无效") from exc
             return checked(data, mime)
+
         if img.startswith(("http://", "https://")):
             try:
                 req = urllib.request.Request(img, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=20) as resp:
+                response = (urllib.request.urlopen(req, timeout=20)
+                            if self.cfg.ref_image_private_fetch
+                            else _open_public_ref_image(img))
+                with response as resp:
                     mime = resp.headers.get_content_type() or "image/png"
                     data = resp.read(MAX_REFERENCE_IMAGE_BYTES + 1)
                 return checked(data, mime)
-            except MuseGenerationError:
+            except (RefImageSafetyError, MuseGenerationError):
                 raise
             except Exception as exc:
-                raise MuseGenerationError(f"下载远程参考图失败: {type(exc).__name__}") from exc
+                raise MuseGenerationError(
+                    f"下载远程参考图失败: {type(exc).__name__}") from exc
+
+        # Raw Base64 contains no server-side path and remains safe in restricted mode.
+        try:
+            return checked(base64.b64decode(img, validate=True), "image/png")
+        except (binascii.Error, ValueError):
+            pass
+
+        if not self.cfg.ref_image_local_files:
+            raise RefImageSafetyError(
+                "参考图本地路径被拒绝；如确需读取服务器文件，请显式设置 "
+                "MUSE2API_REF_IMAGE_LOCAL_FILES=1")
         if os.path.isfile(img):
             try:
                 if os.path.getsize(img) > MAX_REFERENCE_IMAGE_BYTES:
@@ -1254,11 +1342,9 @@ class MuseEngine:
             except MuseGenerationError:
                 raise
             except Exception as exc:
-                raise MuseGenerationError(f"读取本地参考图失败: {type(exc).__name__}") from exc
-        try:
-            return checked(base64.b64decode(img, validate=True), "image/png")
-        except (binascii.Error, ValueError) as exc:
-            raise MuseGenerationError("参考图必须是 URL、Data URL、本地图片或有效 Base64") from exc
+                raise MuseGenerationError(
+                    f"读取本地参考图失败: {type(exc).__name__}") from exc
+        raise MuseGenerationError("参考图必须是 URL、Data URL、本地图片或有效 Base64")
 
     def _clear_attachments(self):
         """清除聊天输入框里遗留的附件缩略图（兼容中/英文 UI）。"""

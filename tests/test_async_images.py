@@ -182,16 +182,16 @@ async def check(source, home):
             "data:image/png;base64,Zmlyc3Q=", "data:image/png;base64,c2Vjb25k"]
         response = await client.post("/v1/images/generations", json={
             "prompt": "generate from two references", "async": True,
-            "images": ["https://example.com/first.png", "https://example.com/second.png"]})
+            "images": ["data:image/png;base64,Zmlyc3Q=", "data:image/png;base64,c2Vjb25k"]})
         assert response.status_code == 202
         assert (await finish(response.json()["task_id"]))["status"] == "completed"
         assert calls[-1][3] == [
-            "https://example.com/first.png", "https://example.com/second.png"]
+            "data:image/png;base64,Zmlyc3Q=", "data:image/png;base64,c2Vjb25k"]
         print("multipart_and_json_reference_forwarding=PASS")
 
         response = await client.post("/v1/videos", json={
             "prompt": "animate two references", "duration": 6,
-            "images": ["https://example.com/start.png", "https://example.com/style.png"]})
+            "images": ["data:image/png;base64,c3RhcnQ=", "data:image/png;base64,c3R5bGU="]})
         assert response.status_code == 200
         video_id = response.json()["task_id"]
         for _ in range(100):
@@ -203,7 +203,7 @@ async def check(source, home):
         assert video.json()["status"] == "completed"
         assert calls[-1][1] == "video"
         assert calls[-1][3] == [
-            "https://example.com/start.png", "https://example.com/style.png"]
+            "data:image/png;base64,c3RhcnQ=", "data:image/png;base64,c3R5bGU="]
         assert "2 张参考图片" in calls[-1][0]
         print("multi_reference_video_forwarding=PASS")
 

@@ -27,6 +27,7 @@ from typing import Any
 
 import asyncio
 import base64
+import binascii
 import io
 import hashlib
 import json
@@ -48,7 +49,7 @@ from config import CFG
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError)
+                    MuseModelRefusalError, RefImageSafetyError)
 from store import Store, account_expiry, min_expiry
 
 import sys
@@ -1038,6 +1039,23 @@ def _image_response(req: ImageRequest, res: dict) -> dict:
     return {"created": int(time.time()), "data": [item]}
 
 
+def _prepare_reference_images(images: list[str]) -> list[str]:
+    """Validate and snapshot all sources before a task is accepted."""
+    prepared = []
+    total_bytes = 0
+    for index, image in enumerate(images):
+        try:
+            b64, mime = engine._normalize_image(image)
+            data = base64.b64decode(b64, validate=True)
+        except (RefImageSafetyError, MuseGenerationError, binascii.Error, ValueError) as exc:
+            raise HTTPException(400, f"images[{index}]: {exc}") from exc
+        total_bytes += len(data)
+        if total_bytes > MAX_REFERENCE_TOTAL_BYTES:
+            raise HTTPException(400, "参考图总大小超过 24 MiB 限制")
+        prepared.append(f"data:{mime};base64,{b64}")
+    return prepared
+
+
 def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
                  idempotency_key: str | None = None):
     """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
@@ -1099,7 +1117,8 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
 @app.post("/v1/images/tasks")
 def create_image_task(req: ImageRequest,
                       idempotency_key: str | None = Header(default=None), _=Depends(auth)):
-    return _queue_image(req, build_image_prompt(req), _image_references(req), idempotency_key)
+    refs = _prepare_reference_images(_image_references(req))
+    return _queue_image(req, build_image_prompt(req), refs, idempotency_key)
 
 
 @app.get("/v1/images/tasks/{task_id}")
@@ -1117,7 +1136,8 @@ def get_image_task(task_id: str, _=Depends(auth)):
 
 @app.post("/v1/images/generations")
 async def images_generations(req: ImageRequest, _=Depends(auth)):
-    ref_images = _image_references(req)
+    ref_images = await asyncio.to_thread(
+        _prepare_reference_images, _image_references(req))
 
     prompt = build_image_prompt(req)
     timeout = req.timeout or CFG.image_timeout
@@ -1148,8 +1168,7 @@ async def images_edits(request: Request, _=Depends(auth)):
 
     if "multipart/form-data" in content_type:
         form = await request.form(
-            max_files=MAX_REFERENCE_IMAGES, max_fields=20,
-            max_part_size=MAX_REFERENCE_IMAGE_BYTES + 1)
+            max_files=MAX_REFERENCE_IMAGES, max_fields=20)
         async_mode = form.get("async", False)
         prompt = form.get("prompt") or ""
         model = form.get("model") or "muse-image"
@@ -1211,6 +1230,8 @@ async def images_edits(request: Request, _=Depends(auth)):
         images=ref_image_data,
         **{"async": async_mode}
     )
+    ref_image_data = await asyncio.to_thread(
+        _prepare_reference_images, ref_image_data)
     full_prompt = build_image_prompt(req_obj)
     gen_timeout = timeout or CFG.image_timeout
     if req_obj.async_:
@@ -1231,7 +1252,8 @@ async def images_edits(request: Request, _=Depends(auth)):
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
 async def create_video(req: VideoRequest, _=Depends(auth)):
-    ref_images = _video_references(req)
+    ref_images = await asyncio.to_thread(
+        _prepare_reference_images, _video_references(req))
 
     prompt = build_video_prompt(req)
     timeout = req.timeout or CFG.video_timeout
