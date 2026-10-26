@@ -207,6 +207,27 @@ async def check(source, home):
         assert "2 张参考图片" in calls[-1][0]
         print("multi_reference_video_forwarding=PASS")
 
+        for bad in [
+            {"prompt": "bad empty reference", "images": [None]},
+            {"prompt": "too many references", "images": ["data:image/png;base64,eA=="] * 5},
+            {"prompt": "conflicting references", "reference_image": "data:image/png;base64,eA==",
+             "images": ["data:image/png;base64,eQ=="]},
+        ]:
+            response = await client.post("/v1/images/generations", json=bad)
+            assert response.status_code == 400, (bad, response.status_code, response.body)
+        video_bad = await client.post("/v1/videos", json={
+            "prompt": "conflicting video references", "image": "data:image/png;base64,eA==",
+            "images": ["data:image/png;base64,eQ=="]})
+        assert video_bad.status_code == 400
+        for bad in [
+            {"prompt": "bad edit array", "images": [None]},
+            {"prompt": "bad edit conflict", "image": "data:image/png;base64,eA==",
+             "images": ["data:image/png;base64,eQ=="]},
+        ]:
+            response = await client.post("/v1/images/edits", json=bad)
+            assert response.status_code == 400, (bad, response.status_code, response.body)
+        print("multi_reference_validation=PASS")
+
         body = {"prompt": "dedicated async request", "reference_image": "data:image/png;base64,eA=="}
         response = await client.post("/v1/images/tasks", json=body, headers={"Idempotency-Key": "fixture-key"})
         assert response.status_code == 202

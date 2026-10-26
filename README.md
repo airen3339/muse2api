@@ -195,7 +195,7 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
 }
 ```
 
-多图参考使用 `images` 数组；服务会按数组顺序逐张上传，并在全部附件得到网页确认后才发送提示词：
+多图参考使用 `images` 数组（最多 4 张；单张不超过 10 MiB、合计不超过 24 MiB）；服务会按数组顺序逐张上传，并在全部附件得到网页确认后才发送提示词。`images` 不可与 `image` / `reference_image` 等旧版单图字段混用：
 
 ```bash
 curl -X POST "http://localhost:18610/v1/images/generations" \
@@ -237,7 +237,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
   ```
   返回任务 ID：`{"id": "task_xyz789", "status": "queued"}`
 
-  多图参考视频在同一个请求中使用有序的 `images` 数组：
+  多图参考视频在同一个请求中使用有序的 `images` 数组；这里支持的是多张图片作为视频参考，不支持上传视频文件作为参考：
   ```bash
   curl -X POST "http://localhost:18610/v1/videos" \
     -H "Authorization: Bearer m2a_your_secret_key" \
@@ -315,6 +315,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 - 🌟 **[@wuliaolaozi](https://github.com/wuliaolaozi)** (PR [#27](https://github.com/czg86389-hub/muse2api/pull/27)) —— 适配中英文额度查询，修复额度读取与管理页错误提示
 - 🌟 **[@CarloCPP](https://github.com/CarloCPP)** (PR [#6](https://github.com/czg86389-hub/muse2api/pull/6), [#26](https://github.com/czg86389-hub/muse2api/pull/26)) —— 贡献 Tampermonkey 油猴一键导号脚本、放宽必要 Cookie 校验至 session 凭证与一键安装
 - 🌟 **[@gr219](https://github.com/gr219)** (PR [#31](https://github.com/czg86389-hub/muse2api/pull/31)) —— 为管理后台及 Chrome 扩展提供中英文国际化双语动态切换支持
+- 🌟 **[@Yeadon8888](https://github.com/Yeadon8888)** (PR [#32](https://github.com/czg86389-hub/muse2api/pull/32)) —— 增加有序多参考图生图、编辑与图生视频支持
 
 欢迎大家提交 PR 与 Issue，共同把项目打磨得更强更好用！
 

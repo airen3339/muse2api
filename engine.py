@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import mimetypes
+import urllib.parse
 import urllib.request
 import json
 import logging
@@ -27,6 +29,9 @@ from cdp import CDP, http_json
 log = logging.getLogger("muse2api")
 
 ATT_SEL = '[data-testid^="hatch-chat-attachment-presentation-"]'
+MAX_REFERENCE_IMAGES = 4
+MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_REFERENCE_TOTAL_BYTES = 24 * 1024 * 1024
 
 # 决定账号生死的核心 cookie（缺失或过期 = 会话失效）
 # 注：hatch_gw 为网关路由缓存，会话生死主要依赖 hatch_sess 与 hatch_vml，缺 gw 亦可正常续签与生成
@@ -40,6 +45,10 @@ class MuseAuthError(RuntimeError):
 
 class MuseGenerationError(RuntimeError):
     pass
+
+
+class MuseModelRefusalError(MuseGenerationError):
+    """Muse completed the turn with text instead of the requested media."""
 
 
 class MuseEngine:
@@ -807,6 +816,11 @@ class MuseEngine:
         t_start = time.time()
         stable_src, stable_n = "", 0
         last_txt, txt_stable = "", 0
+        refusal_last, refusal_stable = "", 0
+        seen_stop = False
+        previous_state = None
+        last_activity = t_start
+        progress_sent = 0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
@@ -858,12 +872,6 @@ class MuseEngine:
                     if stable_n >= 1:
                         return att
             elapsed = time.time() - t_start
-            if on_progress:
-                prog = min(92, int(25 + elapsed * 1.0))
-                try:
-                    on_progress(prog)
-                except Exception:
-                    pass
             cur_cnt = base_agent_cnt
             cur_txt = ""
             has_stop = False
@@ -876,37 +884,110 @@ class MuseEngine:
                     var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
-                    var tail = document.body ? (document.body.innerText||'').slice(-700) : '';
-                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail});
+                    var tail = document.body ? (document.body.innerText||'').slice(-1200) : '';
+                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail,
+                        path: location.pathname || '', href: location.href || ''});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
             except Exception:
                 st = {}
             tail = st.get("tail") or ""
-            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail):
+            cur_cnt = int(st.get("cnt") or 0)
+            cur_txt = st.get("txt") or ""
+            has_stop = bool(st.get("stop"))
+            path = st.get("path") or ""
+            seen_stop = seen_stop or has_stop
+            state = (cur_cnt, cur_txt, len(atts), has_stop, path)
+            if previous_state is None or state != previous_state:
+                last_activity = time.time()
+                previous_state = state
+
+            if on_progress:
+                milestone = 25 if seen_stop else 20
+                if cur_cnt > base_agent_cnt:
+                    milestone = 40
+                if milestone > progress_sent:
+                    try:
+                        on_progress(milestone)
+                        progress_sent = milestone
+                    except Exception:
+                        pass
+
+            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail, re.I):
                 raise MuseGenerationError("账号额度不足")
             # A Stop button is also shown for messages never acknowledged by the gateway.
             if elapsed > 30.0 and cur_cnt == base_agent_cnt and re.search(
-                    r"Still sending|Delivery not confirmed|正在发送|未确认送达", tail):
-                raise MuseGenerationError("提示词未成功送达后端（Still sending / Delivery not confirmed），终止等待并重试")
-            cur_cnt = st.get("cnt") or 0
-            cur_txt = st.get("txt") or ""
-            has_stop = bool(st.get("stop"))
+                    r"Still sending|Delivery not confirmed|正在发送|未确认送达", tail, re.I):
+                raise MuseGenerationError(
+                    "提示词未成功送达后端（Still sending / Delivery not confirmed），终止等待并重试")
+
+            refusal_source = cur_txt if cur_cnt > base_agent_cnt else (
+                tail if seen_stop and not has_stop and elapsed > 20.0 else "")
+            refusal = self._media_refusal_text(refusal_source, expect)
+            if refusal and not has_stop and len(atts) <= base_att_cnt:
+                if refusal == refusal_last:
+                    refusal_stable += 1
+                else:
+                    refusal_last, refusal_stable = refusal, 0
+                if refusal_stable >= 4 and elapsed > 8.0:
+                    raise MuseModelRefusalError(f"模型未生成媒体，仅返回文本: {refusal}")
+            else:
+                refusal_last, refusal_stable = "", 0
+
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                # 检查是否包含媒体文件生成关键词（如 .webp, .png, .mp4, imagine_media 等），若是则说明正在产出媒体，绝不能误判为纯文本拒答
-                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
+                # Media-status text can precede a real attachment; do not fail on it.
+                is_media_report = bool(re.search(
+                    r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|"
+                    r"generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
                 if not is_media_report:
                     if cur_txt == last_txt:
                         txt_stable += 1
                     else:
                         last_txt, txt_stable = cur_txt, 0
                     if txt_stable >= 15 and elapsed > 8.0:
-                        raise MuseGenerationError(f"模型未生成媒体，仅返回文本: {cur_txt[:120]}")
+                        clean = self._clean_model_text(cur_txt)
+                        raise MuseModelRefusalError(
+                            f"模型未生成媒体，仅返回文本: {clean}")
                 else:
                     txt_stable = 0
             else:
                 txt_stable = 0
+
+            # Muse accepted the click but never created a thread. Requiring a completed
+            # Stop-button lifecycle, an idle page, no messages/attachments and /thread/new
+            # avoids treating ordinary long video rendering as failure.
+            if (expect == "video" and seen_stop and not has_stop
+                    and path.rstrip("/").endswith("/thread/new")
+                    and cur_cnt <= base_agent_cnt and len(atts) <= base_att_cnt
+                    and elapsed >= 180.0 and time.time() - last_activity >= 90.0):
+                raise MuseGenerationError(
+                    "Muse 未建立视频任务线程，页面在提交结束后持续无响应（已提前停止等待）")
         return None
+
+    @staticmethod
+    def _clean_model_text(text: str, limit: int = 240) -> str:
+        clean = re.sub(r"\s+", " ", text or "").strip()
+        return clean[:limit]
+
+    @classmethod
+    def _media_refusal_text(cls, text: str, expect: str) -> str:
+        """Return only an explicit media refusal line, never an arbitrary page tail."""
+        if not text:
+            return ""
+        patterns = [
+            r"^(?:没生成成|视频没生成成功|视频未生成成功|视频生成失败)[^\n]{0,240}"
+            r"(?:国家|地区|country|region)[^\n]{0,160}(?:不支持|不可用|无法|not available|unavailable|not supported)",
+            r"^(?:could not|couldn't|cannot|can't|unable to)[^\n]{0,120}video[^\n]{0,160}"
+            r"(?:country|region|not available|unavailable|not supported)",
+        ] if expect == "video" else [
+            r"^(?:图片没生成成功|图片未生成成功|图片生成失败|无法生成图片)",
+            r"^(?:could not|couldn't|cannot|can't|unable to)[^\n]{0,120}image",
+        ]
+        for line in reversed((text or "").splitlines()):
+            clean = cls._clean_model_text(line)
+            if clean and any(re.search(pattern, clean, re.I) for pattern in patterns):
+                return clean
+        return ""
 
     # ---------------- 取字节 ----------------
     _EXTRACT_JS = r"""
@@ -1127,36 +1208,57 @@ class MuseEngine:
 
     @staticmethod
     def _normalize_image(img: str) -> tuple[str, str]:
-        """将各种形态的图片输入归一为 (base64_str, mime_type)。"""
+        """Normalize one image and reject non-images or oversized inputs."""
         if not img:
             return "", "image/png"
         img = str(img).strip()
+
+        def checked(data: bytes, mime: str) -> tuple[str, str]:
+            mime = (mime or "image/png").split(";", 1)[0].strip().lower()
+            if not mime.startswith("image/"):
+                raise MuseGenerationError(f"参考文件不是图片（{mime or 'unknown'}）")
+            if len(data) > MAX_REFERENCE_IMAGE_BYTES:
+                raise MuseGenerationError("单张参考图超过 10 MiB 限制")
+            return base64.b64encode(data).decode("ascii"), mime
+
         if img.startswith("data:"):
-            parts = img.split(",", 1)
-            mime = "image/png"
-            if ";" in parts[0]:
-                mime = parts[0].split(";")[0].replace("data:", "").strip()
-            return (parts[1].strip() if len(parts) > 1 else ""), mime
-        if img.startswith("http://") or img.startswith("https://"):
+            head, sep, payload = img.partition(",")
+            if not sep:
+                raise MuseGenerationError("参考图 Data URL 格式无效")
+            mime = head[5:].split(";", 1)[0] or "image/png"
+            try:
+                data = (base64.b64decode(payload.strip(), validate=True)
+                        if ";base64" in head.lower()
+                        else urllib.parse.unquote_to_bytes(payload))
+            except (binascii.Error, ValueError) as exc:
+                raise MuseGenerationError("参考图 Data URL 编码无效") from exc
+            return checked(data, mime)
+        if img.startswith(("http://", "https://")):
             try:
                 req = urllib.request.Request(img, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=20) as resp:
-                    data = resp.read()
                     mime = resp.headers.get_content_type() or "image/png"
-                    return base64.b64encode(data).decode("ascii"), mime
-            except Exception as e:
-                log.warning("下载远程参考图失败: %s", e)
-                return "", "image/png"
+                    data = resp.read(MAX_REFERENCE_IMAGE_BYTES + 1)
+                return checked(data, mime)
+            except MuseGenerationError:
+                raise
+            except Exception as exc:
+                raise MuseGenerationError(f"下载远程参考图失败: {type(exc).__name__}") from exc
         if os.path.isfile(img):
             try:
+                if os.path.getsize(img) > MAX_REFERENCE_IMAGE_BYTES:
+                    raise MuseGenerationError("单张参考图超过 10 MiB 限制")
                 with open(img, "rb") as f:
-                    data = f.read()
-                    mime = mimetypes.guess_type(img)[0] or "image/png"
-                    return base64.b64encode(data).decode("ascii"), mime
-            except Exception as e:
-                log.warning("读取本地参考图失败: %s", e)
-                return "", "image/png"
-        return img, "image/png"
+                    return checked(f.read(MAX_REFERENCE_IMAGE_BYTES + 1),
+                                   mimetypes.guess_type(img)[0] or "image/png")
+            except MuseGenerationError:
+                raise
+            except Exception as exc:
+                raise MuseGenerationError(f"读取本地参考图失败: {type(exc).__name__}") from exc
+        try:
+            return checked(base64.b64decode(img, validate=True), "image/png")
+        except (binascii.Error, ValueError) as exc:
+            raise MuseGenerationError("参考图必须是 URL、Data URL、本地图片或有效 Base64") from exc
 
     def _clear_attachments(self):
         """清除聊天输入框里遗留的附件缩略图（兼容中/英文 UI）。"""
@@ -1177,13 +1279,22 @@ class MuseEngine:
 
     def _attach_images(self, image_data: list[str]):
         """逐张附加参考图，并确认全部进入 composer。"""
+        if len(image_data) > MAX_REFERENCE_IMAGES:
+            raise MuseGenerationError(f"参考图最多 {MAX_REFERENCE_IMAGES} 张")
         images = []
+        total_bytes = 0
         for index, value in enumerate(image_data):
             if not value:
                 continue
             b64, mime = self._normalize_image(value)
             if not b64:
                 raise MuseGenerationError(f"第 {index + 1} 张参考图读取失败，已停止生成")
+            try:
+                total_bytes += len(base64.b64decode(b64, validate=True))
+            except (binascii.Error, ValueError) as exc:
+                raise MuseGenerationError(f"第 {index + 1} 张参考图编码无效") from exc
+            if total_bytes > MAX_REFERENCE_TOTAL_BYTES:
+                raise MuseGenerationError("参考图总大小超过 24 MiB 限制")
             images.append({"b64": b64, "mime": mime, "index": index + 1})
         if not images:
             return
@@ -1253,19 +1364,15 @@ class MuseEngine:
         while time.time() < deadline:
             attached_count = self.page.js(
                 """(function(){
-                var btns = Array.from(document.querySelectorAll('button[aria-label]'));
+                var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+                var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
+                if (!composer) return 0;
+                var btns = Array.from(composer.querySelectorAll('button[aria-label]'));
                 var removeCount = btns.filter(function(b){
                     return /remove\\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label') || '');
                 }).length;
                 if (removeCount) return removeCount;
-                // 兜底：composer 内出现附件缩略图（img/video）
-                var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
-                var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
-                if (composer) {
-                    var media = composer.querySelectorAll('img, video');
-                    if (media.length > 0) return media.length;
-                }
-                return 0;
+                return composer.querySelectorAll('img, video').length;
                 })()"""
             )
             if int(attached_count or 0) >= len(images):

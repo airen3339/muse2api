@@ -45,7 +45,10 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from pydantic import BaseModel, Field
 
 from config import CFG
-from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError
+from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
+                    MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
+                    MuseAuthError, MuseEngine, MuseGenerationError,
+                    MuseModelRefusalError)
 from store import Store, account_expiry, min_expiry
 
 import sys
@@ -57,7 +60,7 @@ if not log.handlers:
     log.addHandler(_h)
 
 CFG.ensure_dirs()
-app = FastAPI(title="muse2api", version="1.5.4")
+app = FastAPI(title="muse2api", version="1.6.4")
 
 # Cookie 助手脚本从 muse.ai 页面发起导入请求，需要放行该来源；
 # 浏览器扩展从 chrome-extension:// 发起，也一并放行。
@@ -494,37 +497,45 @@ class AccountPatch(BaseModel):
 # ------------------------- 提示词构造 -------------------------
 def _image_value(value: Any) -> str | None:
     if isinstance(value, str):
-        return value or None
+        return value.strip() or None
     if isinstance(value, dict):
         candidate = value.get("image_url") or value.get("url") or value.get("b64_json")
         if isinstance(candidate, dict):
             candidate = candidate.get("url")
-        return candidate if isinstance(candidate, str) and candidate else None
+        return candidate.strip() if isinstance(candidate, str) and candidate.strip() else None
     return None
 
 
-def _image_references(req: ImageRequest) -> list[str]:
-    """Preserve the caller's reference-image order without reinterpreting payloads."""
-    primary = _image_value(req.reference_image) or _image_value(req.image)
+def _reference_list(images: list | None, legacy: list[Any], field: str) -> list[str]:
+    """Validate ordered image references and make legacy precedence explicit."""
+    primary = next((ref for value in legacy if (ref := _image_value(value))), None)
+    if primary and images:
+        raise HTTPException(400, f"{field} 不能与旧版单图字段同时使用")
     if primary:
         return [primary]
-    return [ref for value in (req.images or []) if (ref := _image_value(value))]
+    if images is None:
+        return []
+    if len(images) > MAX_REFERENCE_IMAGES:
+        raise HTTPException(400, f"{field} 最多 {MAX_REFERENCE_IMAGES} 张参考图")
+    refs = []
+    for index, value in enumerate(images):
+        ref = _image_value(value)
+        if not ref:
+            raise HTTPException(400, f"{field}[{index}] 不是有效图片引用")
+        refs.append(ref)
+    return refs
+
+
+def _image_references(req: ImageRequest) -> list[str]:
+    return _reference_list(req.images, [req.reference_image, req.image], "images")
 
 
 def _video_references(req: VideoRequest) -> list[str]:
-    """Keep legacy single-frame fields while allowing ordered content references."""
-    primary = (
-        _image_value(req.reference_image)
-        or _image_value(req.image_url)
-        or _image_value(req.image)
-    )
-    if primary:
-        return [primary]
-    return [ref for value in (req.images or []) if (ref := _image_value(value))]
-
+    return _reference_list(
+        req.images, [req.reference_image, req.image_url, req.image], "images")
 
 def build_image_prompt(r: ImageRequest) -> str:
-    has_ref = bool(r.reference_image or r.image or r.images)
+    has_ref = bool(_image_references(r))
     if has_ref:
         parts = [f"基于我本次上传附带的参考图片进行生图/编辑：{r.prompt.strip()}"]
     else:
@@ -938,7 +949,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             if deadline is not None and time.monotonic() >= deadline:
                 raise MuseGenerationError("任务总等待时限已到，停止重试")
             if attempt > 0:
-                if last_exc and "未产出媒体附件，仅返回了文本回复" in str(last_exc):
+                if isinstance(last_exc, MuseModelRefusalError):
                     break
                 old_id = cur_acc["id"] if cur_acc else None
                 if old_id:
@@ -1136,7 +1147,9 @@ async def images_edits(request: Request, _=Depends(auth)):
     async_mode = False
 
     if "multipart/form-data" in content_type:
-        form = await request.form()
+        form = await request.form(
+            max_files=MAX_REFERENCE_IMAGES, max_fields=20,
+            max_part_size=MAX_REFERENCE_IMAGE_BYTES + 1)
         async_mode = form.get("async", False)
         prompt = form.get("prompt") or ""
         model = form.get("model") or "muse-image"
@@ -1150,14 +1163,26 @@ async def images_edits(request: Request, _=Depends(auth)):
             except ValueError:
                 pass
         img_fields = form.getlist("image")
-        for img_field in img_fields:
+        if len(img_fields) > MAX_REFERENCE_IMAGES:
+            raise HTTPException(400, f"image 最多 {MAX_REFERENCE_IMAGES} 张参考图")
+        total_upload_bytes = 0
+        for index, img_field in enumerate(img_fields):
             if img_field and hasattr(img_field, "read"):
-                content = await img_field.read()
                 ref_mime = getattr(img_field, "content_type", "image/png") or "image/png"
+                if not ref_mime.lower().startswith("image/"):
+                    raise HTTPException(400, f"image[{index}] 不是图片文件")
+                content = await img_field.read(MAX_REFERENCE_IMAGE_BYTES + 1)
+                if len(content) > MAX_REFERENCE_IMAGE_BYTES:
+                    raise HTTPException(400, f"image[{index}] 超过 10 MiB 限制")
+                total_upload_bytes += len(content)
+                if total_upload_bytes > MAX_REFERENCE_TOTAL_BYTES:
+                    raise HTTPException(400, "参考图总大小超过 24 MiB 限制")
                 ref_image_data.append(
                     f"data:{ref_mime};base64,{base64.b64encode(content).decode('ascii')}")
-            elif isinstance(img_field, str) and img_field:
-                ref_image_data.append(img_field)
+            elif isinstance(img_field, str) and img_field.strip():
+                ref_image_data.append(img_field.strip())
+            else:
+                raise HTTPException(400, f"image[{index}] 不是有效图片引用")
     else:
         body = await request.json()
         async_mode = body.get("async", False)
@@ -1167,15 +1192,11 @@ async def images_edits(request: Request, _=Depends(auth)):
         aspect_ratio = body.get("aspect_ratio")
         response_format = body.get("response_format") or "url"
         timeout = body.get("timeout")
-        img_val = _image_value(body.get("image"))
-        if img_val:
-            ref_image_data = [img_val]
-        if not ref_image_data and isinstance(body.get("images"), list):
-            ref_image_data = [
-                ref for value in body["images"] if (ref := _image_value(value))]
-        if not ref_image_data:
-            fallback = _image_value(body.get("reference_image")) or _image_value(body.get("image_url"))
-            ref_image_data = [fallback] if fallback else []
+        raw_images = body.get("images")
+        if raw_images is not None and not isinstance(raw_images, list):
+            raise HTTPException(400, "images 必须是数组")
+        legacy = [body.get("reference_image"), body.get("image_url"), body.get("image")]
+        ref_image_data = _reference_list(raw_images, legacy, "images")
 
     if not prompt:
         prompt = "参考此图片并进行生图创作"
@@ -1259,9 +1280,8 @@ def get_video(task_id: str, _=Depends(auth)):
     if out.get("status") == "completed":
         out["progress"] = 100
     elif out.get("status") == "processing":
-        elapsed = time.time() - out.get("created_at", time.time())
-        calc_prog = min(92, int(20 + elapsed * 1.1))
-        out["progress"] = max(out.get("progress", 0) or 0, calc_prog)
+        # Progress reports observed milestones only; Muse exposes no percentage.
+        out["progress"] = max(out.get("progress", 0) or 0, 15)
     vurl = out.get("url")
     if not vurl and isinstance(out.get("result"), dict):
         vurl = out["result"].get("url")
