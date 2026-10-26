@@ -640,10 +640,13 @@ class MuseEngine:
 
     def quota(self, cookies: dict, expires: dict | None = None,
               account_id: str | None = None) -> dict:
-        """Read the account's quota without depending on the browser UI language."""
-        self.ensure_page(cookies, expires, account_id=account_id)
-        self._dismiss_quota_ui()
+        """Read one account's quota in a fresh, disposable browser context."""
+        # Muse's Settings menu can remain in a half-closed React state after a read.
+        # A disposable context is slower, but prevents consecutive reads from
+        # inheriting stale UI and keeps account cookies strictly isolated.
+        self._close_page()
         try:
+            self.ensure_page(cookies, expires, account_id=account_id)
             self._quota_click(self._QUOTA_SETTINGS_JS, '找不到设置入口（Settings／設定／设置）')
             self._quota_click(self._QUOTA_MENU_JS, '设置菜单未出现可识别的设置项')
             deadline = time.monotonic() + 12.0
@@ -655,10 +658,7 @@ class MuseEngine:
                     raise MuseGenerationError('额度面板未读到有效用量；旧缓存未覆盖')
                 time.sleep(0.2)
         finally:
-            try:
-                self._dismiss_quota_ui()
-            except Exception:
-                log.warning('关闭额度设置面板失败')
+            self._close_page()
 
     @staticmethod
     def _parse_quota(txt: str) -> dict:
