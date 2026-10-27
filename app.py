@@ -1911,10 +1911,12 @@ def extension_zip():
         raise HTTPException(404, "扩展目录缺失")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name in sorted(os.listdir(src)):
-            p = os.path.join(src, name)
-            if os.path.isfile(p):
-                z.write(p, os.path.join("muse2api-extension", name))
+        for root, dirs, names in os.walk(src):
+            dirs.sort()
+            for name in sorted(names):
+                p = os.path.join(root, name)
+                relative_path = os.path.relpath(p, src).replace(os.sep, "/")
+                z.write(p, f"muse2api-extension/{relative_path}")
     buf.seek(0)
     return Response(
         content=buf.getvalue(),
@@ -1930,8 +1932,13 @@ def extension_files():
     src = os.path.join(BASE_DIR, "extension")
     if not os.path.isdir(src):
         raise HTTPException(404, "扩展目录缺失")
-    return {"files": sorted(f for f in os.listdir(src)
-                            if os.path.isfile(os.path.join(src, f)))}
+    files = []
+    for root, dirs, names in os.walk(src):
+        dirs.sort()
+        for name in sorted(names):
+            p = os.path.join(root, name)
+            files.append(os.path.relpath(p, src).replace(os.sep, "/"))
+    return {"files": sorted(files)}
 
 
 # ------------------------- 管理：任务 / 媒体 -------------------------
