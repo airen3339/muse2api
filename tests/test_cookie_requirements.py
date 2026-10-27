@@ -31,10 +31,9 @@ helper = python_constant(ROOT / "tools/get_muse_cookie.py", "ESSENTIAL")
 extension = js_constant(ROOT / "extension/popup.js", "ESSENTIAL")
 userscript = js_constant(ROOT / "tools/muse2api_cookie_importer.user.js", "ESSENTIAL")
 
-assert engine == store, (engine, store)
-assert helper == extension == userscript == EXPECTED_IMPORT
-assert all(name in engine for name in EXPECTED_IMPORT)
+assert engine == store == helper == extension == userscript == EXPECTED_IMPORT, (
+    engine, store, helper, extension, userscript)
 assert "hatch_gw" not in engine + helper + extension + userscript
 manifest = json.loads((ROOT / "extension/manifest.json").read_text(encoding="utf-8"))
 assert tuple(map(int, manifest["version"].split("."))) >= (1, 0, 1)
-print("PASS: cookie importers accept sessions without hatch_gw and match server tokens")
+print("PASS: server and every cookie importer require exactly hatch_sess + hatch_vml")
